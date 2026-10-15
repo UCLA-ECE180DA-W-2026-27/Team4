@@ -8,8 +8,14 @@ import pyttsx3
 recognizer = sr.Recognizer()
 speaker = pyttsx3.init()
 
-# Use Windows default microphone
-mic = sr.Microphone(device_index=0)
+# Subject to change based on mic 
+mic = sr.Microphone(device_index=1)
+mic_index = 1
+
+mic = sr.Microphone(device_index=mic_index)
+
+print("Using microphone:",
+      sr.Microphone.list_microphone_names()[mic_index])
 
 
 def speak(text):
