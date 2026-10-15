@@ -28,7 +28,6 @@ frames = []
 
 print("RECORDING NOW — say START GAME")
 
-# Exactly enough chunks for ~5 seconds
 for _ in range(int(RATE / CHUNK * DURATION)):
     data = stream.read(CHUNK, exception_on_overflow=False)
     frames.append(data)
