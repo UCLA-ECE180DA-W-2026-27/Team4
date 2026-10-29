@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Downloaded object-detection models and text encoders.
+hand_object_detection/yolov8*
+hand_object_detection/yoloe-*.pt
+hand_object_detection/mobileclip2_b.ts
+hand_object_detection/weights/
