@@ -1,9 +1,24 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Python caches
 __pycache__/
 .pytest_cache/
 *.py[cod]
 
-# Downloaded object-detection models and text encoders.
+# Test audio recordings
+*.wav
+
+# Downloaded object-detection models and text encoders
 hand_object_detection/yolov8*
 hand_object_detection/yoloe-*.pt
 hand_object_detection/mobileclip2_b.ts
 hand_object_detection/weights/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
