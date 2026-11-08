@@ -1,0 +1,415 @@
+{
+  "metadata": {
+    "store_name": "CVS Pharmacy - Westwood Blvd",
+    "store_id": "cvs_westwood_0482",
+    "address": "1001 Westwood Blvd, Los Angeles, CA 90024",
+    "default_step_length_m": 0.7,
+    "north_reference_deg": 0.0,
+    "created_at": "2026-11-04",
+    "version": "1.0.0"
+  },
+  "nodes": {
+    "entrance": {
+      "node_id": "entrance",
+      "name": "Store Entrance",
+      "node_type": "entrance",
+      "x": 0.0,
+      "y": 0.0,
+      "landmarks": [
+        {
+          "landmark_id": "lm_entrance_doors",
+          "landmark_type": "door",
+          "text": "WELCOME TO CVS PHARMACY",
+          "expected_bearing_deg": 0.0,
+          "description": "Automatic sliding entrance doors"
+        }
+      ],
+      "products": [],
+      "description": "Main entrance vestibule"
+    },
+    "front_lobby": {
+      "node_id": "front_lobby",
+      "name": "Front Concourse & Shopping Baskets",
+      "node_type": "intersection",
+      "x": 0.0,
+      "y": 3.5,
+      "landmarks": [],
+      "products": [],
+      "description": "Central junction right after entering the store"
+    },
+    "checkout_registers": {
+      "node_id": "checkout_registers",
+      "name": "Checkout Counters & Self-Checkout",
+      "node_type": "checkout",
+      "x": 4.5,
+      "y": 2.0,
+      "landmarks": [
+        {
+          "landmark_id": "lm_checkout_sign",
+          "landmark_type": "overhead_aisle_sign",
+          "text": "CHECKOUT / SELF-CHECKOUT",
+          "expected_bearing_deg": 90.0,
+          "description": "Blue overhead checkout lighted sign"
+        }
+      ],
+      "products": [],
+      "description": "Registers and self-service kiosks"
+    },
+    "main_hallway_center": {
+      "node_id": "main_hallway_center",
+      "name": "Main Center Hallway",
+      "node_type": "intersection",
+      "x": 0.0,
+      "y": 8.0,
+      "landmarks": [],
+      "products": [],
+      "description": "Crossroads between front aisles and pharmacy concourse"
+    },
+    "aisle_4_entrance": {
+      "node_id": "aisle_4_entrance",
+      "name": "Aisle 4 Entrance",
+      "node_type": "intersection",
+      "x": -5.5,
+      "y": 8.0,
+      "landmarks": [
+        {
+          "landmark_id": "lm_aisle_4_sign",
+          "landmark_type": "overhead_aisle_sign",
+          "text": "AISLE 4 SKIN CARE SUN CARE FACIAL CLEANSERS",
+          "expected_bearing_deg": 0.0,
+          "description": "Hanging sign above Aisle 4 entrance"
+        }
+      ],
+      "products": [],
+      "description": "Entrance to Aisle 4 from the center concourse"
+    },
+    "aisle_4_skincare": {
+      "node_id": "aisle_4_skincare",
+      "name": "Aisle 4 - Facial Moisturizers & Lotions",
+      "node_type": "shelf_target",
+      "x": -5.5,
+      "y": 12.5,
+      "landmarks": [],
+      "products": [
+        {
+          "product_id": "prod_cerave_moisturizer",
+          "name": "CeraVe Moisturizing Cream",
+          "category": "moisturizer",
+          "keywords": ["cerave", "moisturizer", "cream", "dry skin", "face lotion", "body lotion", "hyaluronic acid"],
+          "shelf_side": "right",
+          "shelf_height": "middle",
+          "brand": "CeraVe",
+          "description": "16 oz tub with pump, blue and white container"
+        },
+        {
+          "product_id": "prod_neutrogena_hydroboost",
+          "name": "Neutrogena Hydro Boost Water Gel",
+          "category": "moisturizer",
+          "keywords": ["neutrogena", "hydro boost", "water gel", "oil free", "hyaluronic acid", "lightweight"],
+          "shelf_side": "right",
+          "shelf_height": "eye_level",
+          "brand": "Neutrogena",
+          "description": "1.7 oz blue jar"
+        },
+        {
+          "product_id": "prod_cetaphil_lotion",
+          "name": "Cetaphil Daily Hydrating Lotion",
+          "category": "moisturizer",
+          "keywords": ["cetaphil", "daily hydrating", "fragrance free", "sensitive skin", "lotion"],
+          "shelf_side": "right",
+          "shelf_height": "bottom",
+          "brand": "Cetaphil",
+          "description": "3 fl oz green-capped bottle"
+        },
+        {
+          "product_id": "prod_laroche_sunscreen",
+          "name": "La Roche-Posay Anthelios Melt-in Milk SPF 60",
+          "category": "sunscreen",
+          "keywords": ["sunscreen", "sunblock", "spf", "la roche posay", "anthelios", "sun protection"],
+          "shelf_side": "left",
+          "shelf_height": "eye_level",
+          "brand": "La Roche-Posay",
+          "description": "White and orange bottle with SPF 60 label"
+        }
+      ],
+      "description": "Skincare and sun care shelves midway down Aisle 4"
+    },
+    "aisle_4_end": {
+      "node_id": "aisle_4_end",
+      "name": "Aisle 4 Endcap - Body Washes",
+      "node_type": "aisle_waypoint",
+      "x": -5.5,
+      "y": 16.0,
+      "landmarks": [],
+      "products": [
+        {
+          "product_id": "prod_dove_body_wash",
+          "name": "Dove Deep Moisture Body Wash",
+          "category": "soap",
+          "keywords": ["dove", "body wash", "shower gel", "soap"],
+          "shelf_side": "left",
+          "shelf_height": "middle",
+          "brand": "Dove",
+          "description": "Large white bottle with blue drop"
+        }
+      ],
+      "description": "Far back end of Aisle 4 near cosmetics"
+    },
+    "aisle_3_entrance": {
+      "node_id": "aisle_3_entrance",
+      "name": "Aisle 3 Entrance - Pain Relief",
+      "node_type": "intersection",
+      "x": 0.0,
+      "y": 11.0,
+      "landmarks": [
+        {
+          "landmark_id": "lm_aisle_3_sign",
+          "landmark_type": "overhead_aisle_sign",
+          "text": "AISLE 3 PAIN RELIEF FIRST AID EYE CARE",
+          "expected_bearing_deg": 0.0,
+          "description": "Overhead sign marking pain relief and bandages"
+        }
+      ],
+      "products": [],
+      "description": "Entrance to medicine aisle"
+    },
+    "aisle_3_pain_relief": {
+      "node_id": "aisle_3_pain_relief",
+      "name": "Aisle 3 - Pain & Fever Shelves",
+      "node_type": "shelf_target",
+      "x": 0.0,
+      "y": 14.5,
+      "landmarks": [],
+      "products": [
+        {
+          "product_id": "prod_tylenol_extra",
+          "name": "Tylenol Extra Strength 500mg",
+          "category": "pain reliever",
+          "keywords": ["tylenol", "acetaminophen", "headache", "fever", "pain relief"],
+          "shelf_side": "right",
+          "shelf_height": "eye_level",
+          "brand": "Tylenol",
+          "description": "Red box, 100 caplets"
+        },
+        {
+          "product_id": "prod_advil_ibuprofen",
+          "name": "Advil Ibuprofen 200mg",
+          "category": "pain reliever",
+          "keywords": ["advil", "ibuprofen", "tablets", "headache", "body aches"],
+          "shelf_side": "right",
+          "shelf_height": "middle",
+          "brand": "Advil",
+          "description": "Brown circular tablets in blue/yellow box"
+        },
+        {
+          "product_id": "prod_bandaid_flexible",
+          "name": "Band-Aid Brand Flexible Fabric Bandages",
+          "category": "bandaids",
+          "keywords": ["bandaids", "bandages", "first aid", "wound care"],
+          "shelf_side": "left",
+          "shelf_height": "middle",
+          "brand": "Band-Aid",
+          "description": "Assorted 30 pack box"
+        }
+      ],
+      "description": "OTC medications and first aid"
+    },
+    "aisle_2_entrance": {
+      "node_id": "aisle_2_entrance",
+      "name": "Aisle 2 Entrance - Oral & Hair Care",
+      "node_type": "intersection",
+      "x": 5.5,
+      "y": 8.0,
+      "landmarks": [
+        {
+          "landmark_id": "lm_aisle_2_sign",
+          "landmark_type": "overhead_aisle_sign",
+          "text": "AISLE 2 ORAL CARE SHAMPOO DEODORANT",
+          "expected_bearing_deg": 0.0,
+          "description": "Hanging sign above Aisle 2"
+        }
+      ],
+      "products": [],
+      "description": "Personal hygiene aisle entrance"
+    },
+    "aisle_2_personal_care": {
+      "node_id": "aisle_2_personal_care",
+      "name": "Aisle 2 - Toothpaste & Hair Care",
+      "node_type": "shelf_target",
+      "x": 5.5,
+      "y": 12.5,
+      "landmarks": [],
+      "products": [
+        {
+          "product_id": "prod_colgate_total",
+          "name": "Colgate Total Whitening Toothpaste",
+          "category": "toothpaste",
+          "keywords": ["colgate", "toothpaste", "oral care", "whitening"],
+          "shelf_side": "left",
+          "shelf_height": "eye_level",
+          "brand": "Colgate",
+          "description": "Red and white toothpaste tube"
+        },
+        {
+          "product_id": "prod_head_shoulders",
+          "name": "Head & Shoulders Classic Clean Shampoo",
+          "category": "shampoo",
+          "keywords": ["head and shoulders", "shampoo", "dandruff", "hair care"],
+          "shelf_side": "right",
+          "shelf_height": "middle",
+          "brand": "Head & Shoulders",
+          "description": "White bottle with blue cap"
+        }
+      ],
+      "description": "Toothpaste, toothbrushes, shampoo, conditioners"
+    },
+    "back_concourse": {
+      "node_id": "back_concourse",
+      "name": "Back Crosswalk",
+      "node_type": "intersection",
+      "x": 0.0,
+      "y": 18.0,
+      "landmarks": [],
+      "products": [],
+      "description": "Wide corridor connecting back ends of aisles to the pharmacy"
+    },
+    "pharmacy_counter": {
+      "node_id": "pharmacy_counter",
+      "name": "Pharmacy Drop-off & Consultation Counter",
+      "node_type": "info_desk",
+      "x": 0.0,
+      "y": 21.0,
+      "landmarks": [
+        {
+          "landmark_id": "lm_pharmacy_counter",
+          "landmark_type": "counter",
+          "text": "PHARMACY CONSULTATION AND PICK UP",
+          "expected_bearing_deg": 0.0,
+          "description": "Large illuminated CVS Pharmacy elevated counter"
+        }
+      ],
+      "products": [],
+      "description": "Prescription pickup counter"
+    }
+  },
+  "edges": [
+    {
+      "from_node": "entrance",
+      "to_node": "front_lobby",
+      "distance_meters": 3.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 5,
+      "notes": "Walk forward through sliding doors into front lobby"
+    },
+    {
+      "from_node": "front_lobby",
+      "to_node": "checkout_registers",
+      "distance_meters": 4.7,
+      "heading_deg": 108.0,
+      "bidirectional": true,
+      "approx_steps": 7,
+      "notes": "Registers on the right side of the front area"
+    },
+    {
+      "from_node": "front_lobby",
+      "to_node": "main_hallway_center",
+      "distance_meters": 4.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 6,
+      "notes": "Main walkway proceeding straight north into the store"
+    },
+    {
+      "from_node": "main_hallway_center",
+      "to_node": "aisle_4_entrance",
+      "distance_meters": 5.5,
+      "heading_deg": 270.0,
+      "bidirectional": true,
+      "approx_steps": 8,
+      "notes": "Turn 90 degrees left from center concourse to reach Aisle 4 entrance"
+    },
+    {
+      "from_node": "aisle_4_entrance",
+      "to_node": "aisle_4_skincare",
+      "distance_meters": 4.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 6,
+      "notes": "Turn right into Aisle 4 walking north towards skincare"
+    },
+    {
+      "from_node": "aisle_4_skincare",
+      "to_node": "aisle_4_end",
+      "distance_meters": 3.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 5,
+      "notes": "Continue north along Aisle 4 towards body wash endcap"
+    },
+    {
+      "from_node": "main_hallway_center",
+      "to_node": "aisle_3_entrance",
+      "distance_meters": 3.0,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 4,
+      "notes": "Continue straight north into Aisle 3"
+    },
+    {
+      "from_node": "aisle_3_entrance",
+      "to_node": "aisle_3_pain_relief",
+      "distance_meters": 3.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 5,
+      "notes": "Straight down Aisle 3 to pain relievers"
+    },
+    {
+      "from_node": "main_hallway_center",
+      "to_node": "aisle_2_entrance",
+      "distance_meters": 5.5,
+      "heading_deg": 90.0,
+      "bidirectional": true,
+      "approx_steps": 8,
+      "notes": "Turn 90 degrees right from center concourse to reach Aisle 2 entrance"
+    },
+    {
+      "from_node": "aisle_2_entrance",
+      "to_node": "aisle_2_personal_care",
+      "distance_meters": 4.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 6,
+      "notes": "Turn left into Aisle 2 walking north"
+    },
+    {
+      "from_node": "aisle_3_pain_relief",
+      "to_node": "back_concourse",
+      "distance_meters": 3.5,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 5,
+      "notes": "Exit Aisle 3 into back concourse"
+    },
+    {
+      "from_node": "aisle_4_end",
+      "to_node": "back_concourse",
+      "distance_meters": 5.8,
+      "heading_deg": 70.0,
+      "bidirectional": true,
+      "approx_steps": 8,
+      "notes": "Crosswalk connecting back of Aisle 4 to back center concourse"
+    },
+    {
+      "from_node": "back_concourse",
+      "to_node": "pharmacy_counter",
+      "distance_meters": 3.0,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 4,
+      "notes": "Straight forward to Pharmacy pickup window"
+    }
+  ]
+}
+
