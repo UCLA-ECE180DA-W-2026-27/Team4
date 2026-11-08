@@ -25,7 +25,7 @@ conda activate tetris
 On a laptop, install the required packages with:
 
 ```bash
-python -m pip install opencv-python mediapipe numpy ultralytics
+python -m pip install opencv-python mediapipe numpy ultralytics pyttsx3
 python -m pip install "git+https://github.com/ultralytics/CLIP.git"
 ```
 
@@ -40,6 +40,7 @@ python -m pip install --no-cache-dir \
   "mediapipe==0.10.15"
 python -m pip install ultralytics
 python -m pip install "git+https://github.com/ultralytics/CLIP.git"
+python -m pip install pyttsx3
 ```
 
 PyTorch, Ultralytics, and the CLIP text encoder require considerably more disk
@@ -84,6 +85,14 @@ On a Mac:
 cd /Users/jiali/180DATeam4/hand_object_detection
 conda activate tetris
 python hand_orientation.py --laptop
+```
+
+The default `--camera-facing away` mode is for the external webcam pointing in
+the same direction as the user, toward the product. When validating with a
+laptop camera that faces the user, select the opposite horizontal orientation:
+
+```bash
+python hand_orientation.py --laptop --camera-facing user
 ```
 
 On a Raspberry Pi:
@@ -142,8 +151,12 @@ object's bounding box. A circle around the object shows the alignment radius.
 Outside that circle, the display gives one or two directions such as:
 
 ```text
-MOVE HAND: LEFT | UP
+MOVE HAND: RIGHT | DOWN
 ```
+
+The instruction prioritizes horizontal movement. It adds `UP` or `DOWN` only
+when the palm's vertical offset is larger than the circle radius, meaning that
+moving directly left or right cannot bring the palm center into the circle.
 
 Once the palm center enters the circle, the display changes to:
 
@@ -157,13 +170,42 @@ occludes it. A yellow box labeled `last known` indicates that cached position,
 and guidance continues toward it. Detecting the object again refreshes the
 position; restarting the program clears it.
 
-Directions are relative to the displayed preview, including its mirror setting.
-The default circle radius is 10% of the shorter frame dimension. Change it with:
+Horizontal command labels use the face-relative convention: the calculated
+`LEFT` correction is announced as `RIGHT`, and `RIGHT` is announced as `LEFT`.
+`--camera-facing away` is the default product-facing webcam orientation; use
+`--camera-facing user` when the camera points back at the user.
+Product-facing `away` mode is unmirrored, so physical rightward movement appears
+rightward on screen. User-facing mode uses a mirrored preview. The preview
+setting does not change guidance. The default circle radius is 7.5% of the
+shorter frame dimension. Change it with:
 
 ```bash
 python hand_orientation.py --laptop \
   --object bottle \
   --guidance-radius 0.08
+```
+
+Guidance is displayed silently by default. Add `--speak-guidance` to speak only
+the actionable directions. Waiting/status text is not spoken. The current
+instruction is spoken immediately and then repeated every 1.8 seconds. A
+direction change does not bypass that interval. Guidance is announced using
+macOS `say` on a laptop or eSpeak on the Raspberry Pi. Entering the aligned
+state is the exception: `reach forward` is spoken immediately, then follows the
+normal 1.8-second repeat interval. The first fresh target detection also says
+`object detected`. That message is re-armed only after a visible hand disappears
+and is spoken once when the object is freshly detected again:
+
+```bash
+python hand_orientation.py --pi \
+  --object bottle \
+  --speak-guidance
+```
+
+On Raspberry Pi OS, install the eSpeak backend if text-to-speech cannot
+initialize:
+
+```bash
+sudo apt install espeak-ng libespeak1
 ```
 
 Object detection runs every third camera frame by default to reduce Raspberry
@@ -187,9 +229,9 @@ Both estimates use the same camera-centered convention:
 - `+Z`: forward from the camera into the scene
 - Units: meters
 
-Inference always uses the raw camera image, so XYZ signs do not change when the
-preview is mirrored. Use `--no-mirror` for a preview that directly matches the
-physical camera-coordinate directions.
+Inference always uses the raw camera image, so XYZ signs and guidance do not
+change with the preview. Product-facing `away` mode displays the raw preview.
+User-facing mode mirrors the preview unless `--no-mirror` is supplied.
 
 The Logitech C270's nominal 55-degree diagonal field of view is used by
 default. Override it for another camera:

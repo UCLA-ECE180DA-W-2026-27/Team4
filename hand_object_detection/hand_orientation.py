@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +42,8 @@ DEFAULT_OBJECT_CONFIDENCE = 0.25
 DEFAULT_OBJECT_NMS_THRESHOLD = 0.45
 DEFAULT_OBJECT_INPUT_SIZE = 320
 DEFAULT_OBJECT_DETECTION_INTERVAL = 3
-DEFAULT_GUIDANCE_RADIUS_FRACTION = 0.10
+DEFAULT_GUIDANCE_RADIUS_FRACTION = 0.075
+SPEECH_CHANGE_BUFFER_SECONDS = 1.8
 MAX_CAMERA_READ_FAILURES = 30
 CAMERA_RETRY_DELAY_SECONDS = 0.1
 LAPTOP_LOGITECH_CAMERA_INDEX = 0
@@ -101,6 +104,103 @@ class ObjectDetection:
 
     box: tuple[int, int, int, int]
     confidence: float
+
+
+class GuidanceSpeaker:
+    """Repeat actionable guidance asynchronously with the system TTS voice."""
+
+    def __init__(self, computer: str) -> None:
+        if computer == "laptop":
+            speech_program = shutil.which("say")
+            if speech_program is None:
+                raise RuntimeError("Spoken guidance requires the macOS 'say' command.")
+            self._command_prefix = [speech_program, "-r", "150"]
+        else:
+            speech_program = shutil.which("espeak-ng") or shutil.which("espeak")
+            if speech_program is None:
+                raise RuntimeError(
+                    "Spoken guidance requires eSpeak. Install it with "
+                    "'sudo apt install espeak-ng'."
+                )
+            self._command_prefix = [speech_program, "-s", "150"]
+
+        self._last_message: str | None = None
+        self._last_announcement_at: float | None = None
+        self._process: subprocess.Popen | None = None
+        self._object_detection_announced = False
+        self._object_reannouncement_armed = False
+        self._hand_was_visible = False
+
+    def _stop_current_message(self) -> None:
+        """Stop obsolete speech so the latest instruction can play promptly."""
+        process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+        self._process = None
+
+    def _start_speech(self, message: str, now: float) -> bool:
+        """Start one non-blocking message and record its start time."""
+        self._stop_current_message()
+        try:
+            self._process = subprocess.Popen(
+                [*self._command_prefix, message],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            print(f"Could not speak guidance: {error}")
+            return False
+        self._last_announcement_at = now
+        return True
+
+    def announce(self, displayed_guidance: str) -> None:
+        """Repeat the current instruction at 1.8-second intervals."""
+        message = spoken_guidance(displayed_guidance)
+        if message is None:
+            return
+
+        now = time.monotonic()
+        entering_reach = (
+            message == "Reach forward." and message != self._last_message
+        )
+        if (
+            not entering_reach
+            and self._last_announcement_at is not None
+            and now - self._last_announcement_at < SPEECH_CHANGE_BUFFER_SECONDS
+        ):
+            return
+
+        if self._start_speech(message, now):
+            self._last_message = message
+
+    def announce_object_detection(
+        self,
+        hand_visible: bool,
+        object_detected_now: bool,
+    ) -> None:
+        """Announce the first detection, then re-arm after the hand disappears."""
+        hand_disappeared = self._hand_was_visible and not hand_visible
+        self._hand_was_visible = hand_visible
+        if hand_disappeared and self._object_detection_announced:
+            self._object_reannouncement_armed = True
+
+        should_announce = object_detected_now and (
+            not self._object_detection_announced
+            or self._object_reannouncement_armed
+        )
+        if not should_announce:
+            return
+
+        if self._start_speech("Object detected.", time.monotonic()):
+            self._object_detection_announced = True
+            self._object_reannouncement_armed = False
+
+    def close(self) -> None:
+        """Stop active speech when the program exits."""
+        self._stop_current_message()
 
 
 class YoloE26ObjectDetector:
@@ -417,27 +517,41 @@ def guidance_text(
     palm_center: tuple[int, int],
     object_center: tuple[int, int],
     alignment_radius: int,
+    reverse_horizontal: bool = False,
 ) -> tuple[str, bool]:
-    """Return displayed-frame movement guidance and alignment state."""
+    """Return physical movement guidance and alignment state."""
     delta_x = object_center[0] - palm_center[0]
+    if reverse_horizontal:
+        delta_x = -delta_x
     delta_y = object_center[1] - palm_center[1]
-    if math.hypot(delta_x, delta_y) <= alignment_radius:
+    distance = math.hypot(delta_x, delta_y)
+    if distance <= alignment_radius:
         return "ALIGNED: MOVE FORWARD / REACH", True
 
     directions: list[str] = []
     axis_deadband = max(1.0, alignment_radius * 0.35)
     if delta_x < -axis_deadband:
-        directions.append("LEFT")
-    elif delta_x > axis_deadband:
         directions.append("RIGHT")
-    if delta_y < -axis_deadband:
-        directions.append("UP")
-    elif delta_y > axis_deadband:
-        directions.append("DOWN")
+    elif delta_x > axis_deadband:
+        directions.append("LEFT")
+    if abs(delta_y) > alignment_radius:
+        directions.append("UP" if delta_y < 0 else "DOWN")
 
     if not directions:
-        directions.append("LEFT" if delta_x < 0 else "RIGHT")
+        directions.append("RIGHT" if delta_x < 0 else "LEFT")
     return "MOVE HAND: " + " | ".join(directions), False
+
+
+def spoken_guidance(displayed_guidance: str) -> str | None:
+    """Return only the directional part of actionable guidance."""
+    if displayed_guidance == "ALIGNED: MOVE FORWARD / REACH":
+        return "Reach forward."
+    if displayed_guidance.startswith("MOVE HAND: "):
+        _, separator, directions = displayed_guidance.partition(": ")
+        if separator:
+            natural_directions = directions.replace(" | ", " and ").lower()
+            return f"{natural_directions.capitalize()}."
+    return None
 
 
 def draw_hand_and_palm_center(
@@ -620,6 +734,15 @@ def parse_args() -> argparse.Namespace:
         help="Override the default Logitech camera index",
     )
     parser.add_argument(
+        "--camera-facing",
+        choices=("away", "user"),
+        default="away",
+        help=(
+            "Camera direction relative to the user: 'away' for a product-facing "
+            "webcam (default), or 'user' for a camera facing the user"
+        ),
+    )
+    parser.add_argument(
         "--model",
         type=Path,
         default=DEFAULT_MODEL_PATH,
@@ -673,8 +796,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GUIDANCE_RADIUS_FRACTION,
         help=(
             "Alignment radius as a fraction of the shorter frame side "
-            "(default: 0.10)"
+            "(default: 0.075)"
         ),
+    )
+    parser.add_argument(
+        "--speak-guidance",
+        action="store_true",
+        help="Speak guidance changes using the system text-to-speech voice",
     )
     parser.add_argument(
         "--smoothing",
@@ -705,7 +833,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-mirror",
         action="store_true",
-        help="Display the raw camera image instead of a mirror image",
+        help="Display the raw camera image instead of the mirrored preview",
     )
     args = parser.parse_args()
 
@@ -826,10 +954,18 @@ def main() -> None:
     previous_timestamp_ms = -1
     window_name = f"Palm and Object Detection - {target_name}"
     consecutive_camera_failures = 0
-    mirrored_display = not args.no_mirror
+    mirrored_display = args.camera_facing == "user" and not args.no_mirror
     frame_number = 0
     object_detection: ObjectDetection | None = None
     object_visible = False
+    guidance_speaker: GuidanceSpeaker | None = None
+    if args.speak_guidance:
+        try:
+            guidance_speaker = GuidanceSpeaker(args.computer)
+        except RuntimeError as error:
+            capture.release()
+            raise SystemExit(str(error)) from error
+        print("Spoken guidance enabled using the system text-to-speech voice.")
 
     try:
         with vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -860,7 +996,8 @@ def main() -> None:
                 previous_timestamp_ms = timestamp_ms
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-                if frame_number % args.object_every == 0:
+                object_detection_ran = frame_number % args.object_every == 0
+                if object_detection_ran:
                     current_object_detection = object_detector.detect(camera_frame)
                     object_visible = current_object_detection is not None
                     if current_object_detection is not None:
@@ -884,10 +1021,17 @@ def main() -> None:
 
                 palm_xyz: np.ndarray | None = None
                 palm_display_center: tuple[int, int] | None = None
+                palm_camera_center: tuple[int, int] | None = None
                 palm_status = "PALM: not detected"
                 if selected_index is not None:
                     image_landmarks = result.hand_landmarks[selected_index]
                     palm_center = palm_center_normalized(image_landmarks)
+                    palm_camera_center = _display_normalized_point(
+                        palm_center,
+                        width,
+                        height,
+                        False,
+                    )
                     palm_display_center = _display_normalized_point(
                         palm_center,
                         width,
@@ -934,8 +1078,14 @@ def main() -> None:
 
                 object_xyz: np.ndarray | None = None
                 object_display_center: tuple[int, int] | None = None
+                object_camera_center: tuple[int, int] | None = None
                 object_status = f"OBJECT ({target_name}): not detected"
                 if object_detection is not None:
+                    object_camera_center = _display_object_center(
+                        object_detection,
+                        width,
+                        False,
+                    )
                     object_display_center = _display_object_center(
                         object_detection,
                         width,
@@ -1031,18 +1181,26 @@ def main() -> None:
                 )
                 guidance = ""
                 aligned = False
-                if palm_display_center is not None and object_display_center is not None:
+                if palm_camera_center is not None and object_camera_center is not None:
                     guidance, aligned = guidance_text(
-                        palm_display_center,
-                        object_display_center,
+                        palm_camera_center,
+                        object_camera_center,
                         alignment_radius_pixels,
+                        reverse_horizontal=args.camera_facing == "user",
                     )
-                elif palm_display_center is None and object_display_center is None:
+                elif palm_camera_center is None and object_camera_center is None:
                     guidance = "GUIDANCE WAITING: show palm and target object"
-                elif palm_display_center is None:
+                elif palm_camera_center is None:
                     guidance = "GUIDANCE WAITING: show palm"
                 else:
                     guidance = "GUIDANCE WAITING: show target object"
+
+                if guidance_speaker is not None:
+                    guidance_speaker.announce(guidance)
+                    guidance_speaker.announce_object_detection(
+                        hand_visible=palm_camera_center is not None,
+                        object_detected_now=object_detection_ran and object_visible,
+                    )
 
                 if object_display_center is not None:
                     cv2.circle(
@@ -1120,6 +1278,8 @@ def main() -> None:
                 if key in (ord("q"), 27):
                     break
     finally:
+        if guidance_speaker is not None:
+            guidance_speaker.close()
         capture.release()
         cv2.destroyAllWindows()
 
