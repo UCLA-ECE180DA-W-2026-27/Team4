@@ -1,7 +1,6 @@
 import json
 import matplotlib.pyplot as plt
 
-# Load your stored map database
 MAP_FILE = "store_map.json"
 
 try:
@@ -13,12 +12,10 @@ except FileNotFoundError:
   )
   exit()
 
-# Extract the path history coordinates
 path = map_data.get("path_history", [])
 x_coords = [pt["x"] for pt in path]
 y_coords = [pt["y"] for pt in path]
 
-# Plot the map and the route
 plt.figure(figsize=(6, 6))
 plt.plot(
     x_coords,
@@ -30,7 +27,6 @@ plt.plot(
     label="Walking Route",
 )
 
-# Highlight start and end points
 if x_coords and y_coords:
   plt.scatter(
       x_coords[0],
