@@ -5,7 +5,7 @@ STEP_THRESHOLD = 18000
 STEP_REFRACTORY = 0.3  
 STEP_LENGTH = 1.0       
 STALL_TIMEOUT = 2.0
-
+TURN_RATE_LIMIT = 45.0  
 map_data = {"current_position": {"x": 0.0, "y": 0.0},
             "path_history": [{"x": 0.0, "y": 0.0}], "waypoints": []}
 
@@ -66,22 +66,27 @@ try:
                 dt = (now - last_t) if last_t else 0.0
                 last_t = now
                 gz_c = gz - gz_bias
+                rate_dps = abs(gz_c) * 0.00875
                 if abs(gz_c) > 50:
                     heading -= math.radians(gz_c * 0.00875)* dt
 
                 mag = math.sqrt(ax**2 + ay**2 + az**2)
                 max_mag = max(max_mag, mag)
-
-                if (prev_mag > STEP_THRESHOLD and prev_mag >= prev_prev_mag
-                        and prev_mag > mag and now - last_step_t > STEP_REFRACTORY):
-                    step_count += 1
-                    last_step_t = now
-                    map_data["current_position"]["x"] += STEP_LENGTH * math.sin(heading)
-                    map_data["current_position"]["y"] += STEP_LENGTH * math.cos(heading)
-                    pos = {k: round(v, 2) for k, v in map_data["current_position"].items()}
-                    map_data["path_history"].append(pos)
-                    save()
-                    print(f"[STEP {step_count}] {math.degrees(heading):.0f}° | {pos}")
+                is_peak = (prev_mag > STEP_THRESHOLD and prev_mag >= prev_prev_mag
+           and prev_mag > mag and now - last_step_t > STEP_REFRACTORY)
+                if is_peak:         
+                    if rate_dps >= TURN_RATE_LIMIT:
+                        print(f"[skip] turning at {rate_dps:.0f} dps")
+                    else:
+                        step_count += 1
+                        last_step_t = now
+                        map_data["current_position"]["x"] += STEP_LENGTH * math.sin(heading)
+                        map_data["current_position"]["y"] += STEP_LENGTH * math.cos(heading)
+                        pos = {k: round(v, 2) for k, v in map_data["current_position"].items()}
+                        map_data["path_history"].append(pos)
+                        save()
+                        print(f"[STEP {step_count}] {math.degrees(heading):.0f}° | {pos} | {rate_dps:.0f} dps")
+            
 
                 prev_prev_mag, prev_mag = prev_mag, mag
 
