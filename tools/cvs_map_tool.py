@@ -261,6 +261,111 @@ def cmd_create(args):
     print(f"\n[✓] Store map successfully saved to: {output_path.resolve()}")
 
 
+def cmd_import_imu(args):
+    """Convert raw IMU store_map.json (from live_imu_mapper) into a full StoreMap with Dijkstra routing."""
+    import json, math, re
+
+    imu_path = Path(args.imu_map)
+    if not imu_path.exists():
+        print(f"[-] Error: IMU map file '{imu_path}' not found.")
+        return
+
+    with open(imu_path, "r") as f:
+        data = json.load(f)
+
+    waypoints = data.get("waypoints", [])
+    if not waypoints:
+        print("[-] Warning: No tagged waypoints found in store_map.json. Tag waypoints during your walk first!")
+        return
+
+    print(f"\n[+] Importing {len(waypoints)} waypoints from IMU walk: {imu_path}...")
+
+    store_map = StoreMap(
+        metadata=StoreMetadata(
+            store_name=args.store_name,
+            store_id="cvs_imu_import",
+            default_step_length_m=0.7,
+        )
+    )
+
+    # Always ensure entrance at (0, 0)
+    entrance_id = "entrance"
+    store_map.nodes[entrance_id] = MapNode(
+        node_id=entrance_id,
+        name="Store Entrance",
+        node_type=NodeType.ENTRANCE,
+        x=0.0,
+        y=0.0,
+        description="Starting location from IMU survey"
+    )
+
+    prev_node_id = entrance_id
+    prev_x, prev_y = 0.0, 0.0
+
+    for i, wp in enumerate(waypoints, 1):
+        raw_name = wp.get("name", f"Section {i}")
+        slug = re.sub(r"[^a-zA-Z0-9]+", "_", raw_name).strip("_").lower()
+        node_id = f"node_{i}_{slug}"
+        side_str = wp.get("side", "center").lower()
+        wx = float(wp.get("x", 0.0))
+        wy = float(wp.get("y", 0.0))
+
+        products = []
+        if side_str in ("right", "left"):
+            node_type = NodeType.SHELF_TARGET
+            shelf_side = ShelfSide.RIGHT if side_str == "right" else ShelfSide.LEFT
+            products.append(
+                ProductPlacement(
+                    product_id=f"prod_{i}",
+                    name=raw_name,
+                    category=raw_name.lower(),
+                    shelf_side=shelf_side,
+                    shelf_height=ShelfHeight.MIDDLE,
+                    keywords=[k.strip().lower() for k in raw_name.replace("(", " ").replace(")", " ").split() if len(k) > 2]
+                )
+            )
+        else:
+            node_type = NodeType.INTERSECTION
+
+        store_map.nodes[node_id] = MapNode(
+            node_id=node_id,
+            name=raw_name,
+            node_type=node_type,
+            x=wx,
+            y=wy,
+            products=products,
+        )
+
+        # Connect with edge
+        dx = wx - prev_x
+        dy = wy - prev_y
+        dist = max(0.5, round(math.hypot(dx, dy), 2))
+        # 0 deg = North (+Y), 90 deg = East (+X)
+        heading_deg = round(math.degrees(math.atan2(dx, dy)) % 360, 1)
+
+        store_map.edges.append(
+            MapEdge(
+                from_node=prev_node_id,
+                to_node=node_id,
+                distance_meters=dist,
+                heading_deg=heading_deg,
+                bidirectional=True,
+                approx_steps=max(1, round(dist / 0.7)),
+            )
+        )
+
+        prev_node_id = node_id
+        prev_x, prev_y = wx, wy
+
+    out_path = Path(args.output)
+    MapSerializer.save_to_json(store_map, out_path)
+    print(f"[✓] Successfully generated navigable StoreMap: {out_path.resolve()}")
+    print(f"    Nodes created: {len(store_map.nodes)}")
+    print(f"    Edges created: {len(store_map.edges)}")
+    print(f"\nYou can now simulate navigation immediately:")
+    print(f"  python tools/cvs_map_tool.py navigate --map {out_path} --from entrance --query 'moisturizer'")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CVS Store Map CLI Tool for Blind Assistive Shopping",
@@ -295,6 +400,12 @@ def main():
     p_create = subparsers.add_parser("create", help="Interactive store map builder wizard")
     p_create.add_argument("--output", "-o", default="data/my_cvs_map.json", help="Output file path")
 
+    # Import IMU
+    p_imp = subparsers.add_parser("import-imu", help="Convert raw IMU store_map.json into navigable StoreMap")
+    p_imp.add_argument("--imu-map", default="imu_Test/store_map.json", help="Path to raw IMU store_map.json")
+    p_imp.add_argument("--output", "-o", default="data/cvs_from_imu.json", help="Output StoreMap JSON path")
+    p_imp.add_argument("--store-name", default="CVS Pharmacy (IMU Survey)", help="Store name")
+
     args = parser.parse_args()
 
     if args.command == "validate":
@@ -307,6 +418,8 @@ def main():
         cmd_visualize(args)
     elif args.command == "create":
         cmd_create(args)
+    elif args.command == "import-imu":
+        cmd_import_imu(args)
 
 
 if __name__ == "__main__":
