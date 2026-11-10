@@ -1,0 +1,129 @@
+{
+  "metadata": {
+    "store_name": "CVS Pharmacy (IMU Survey)",
+    "store_id": "cvs_imu_import",
+    "address": null,
+    "default_step_length_m": 0.7,
+    "north_reference_deg": 0.0,
+    "created_at": null,
+    "version": "1.0.0"
+  },
+  "nodes": {
+    "entrance": {
+      "node_id": "entrance",
+      "name": "Store Entrance",
+      "node_type": "entrance",
+      "x": 0.0,
+      "y": 0.0,
+      "landmarks": [],
+      "products": [],
+      "description": "Starting location from IMU survey"
+    },
+    "node_1_front_concourse": {
+      "node_id": "node_1_front_concourse",
+      "name": "Front Concourse",
+      "node_type": "intersection",
+      "x": 0.0,
+      "y": 4.2,
+      "landmarks": [],
+      "products": [],
+      "description": null
+    },
+    "node_2_aisle_4_entrance": {
+      "node_id": "node_2_aisle_4_entrance",
+      "name": "Aisle 4 Entrance",
+      "node_type": "intersection",
+      "x": 3.5,
+      "y": 4.2,
+      "landmarks": [],
+      "products": [],
+      "description": null
+    },
+    "node_3_moisturizers_cerave": {
+      "node_id": "node_3_moisturizers_cerave",
+      "name": "Moisturizers (CeraVe)",
+      "node_type": "shelf_target",
+      "x": 4.2,
+      "y": 7.7,
+      "landmarks": [],
+      "products": [
+        {
+          "product_id": "prod_3",
+          "name": "Moisturizers (CeraVe)",
+          "category": "moisturizers (cerave)",
+          "keywords": [
+            "moisturizers",
+            "cerave"
+          ],
+          "shelf_side": "right",
+          "shelf_height": "middle",
+          "brand": null,
+          "description": null
+        }
+      ],
+      "description": null
+    },
+    "node_4_sunscreen_la_roche_posay": {
+      "node_id": "node_4_sunscreen_la_roche_posay",
+      "name": "Sunscreen (La Roche-Posay)",
+      "node_type": "shelf_target",
+      "x": 4.2,
+      "y": 10.5,
+      "landmarks": [],
+      "products": [
+        {
+          "product_id": "prod_4",
+          "name": "Sunscreen (La Roche-Posay)",
+          "category": "sunscreen (la roche-posay)",
+          "keywords": [
+            "sunscreen",
+            "roche-posay"
+          ],
+          "shelf_side": "left",
+          "shelf_height": "middle",
+          "brand": null,
+          "description": null
+        }
+      ],
+      "description": null
+    }
+  },
+  "edges": [
+    {
+      "from_node": "entrance",
+      "to_node": "node_1_front_concourse",
+      "distance_meters": 4.2,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 6,
+      "notes": null
+    },
+    {
+      "from_node": "node_1_front_concourse",
+      "to_node": "node_2_aisle_4_entrance",
+      "distance_meters": 3.5,
+      "heading_deg": 90.0,
+      "bidirectional": true,
+      "approx_steps": 5,
+      "notes": null
+    },
+    {
+      "from_node": "node_2_aisle_4_entrance",
+      "to_node": "node_3_moisturizers_cerave",
+      "distance_meters": 3.57,
+      "heading_deg": 11.3,
+      "bidirectional": true,
+      "approx_steps": 5,
+      "notes": null
+    },
+    {
+      "from_node": "node_3_moisturizers_cerave",
+      "to_node": "node_4_sunscreen_la_roche_posay",
+      "distance_meters": 2.8,
+      "heading_deg": 0.0,
+      "bidirectional": true,
+      "approx_steps": 4,
+      "notes": null
+    }
+  ]
+}
