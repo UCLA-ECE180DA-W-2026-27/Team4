@@ -14,6 +14,7 @@ STEP_THRESHOLD = 18000
 STEP_REFRACTORY = 0.3
 STEP_LENGTH = 0.7  
 STALL_TIMEOUT = 2.0
+TURN_RATE_LIMIT = 45.0
 
 map_data = {
     "current_position": {"x": 0.0, "y": 0.0},
@@ -240,19 +241,22 @@ def main():
 
                 mag = math.sqrt(ax**2 + ay**2 + az**2)
                 max_mag = max(max_mag, mag)
-
-                if (prev_mag > STEP_THRESHOLD and prev_mag >= prev_prev_mag
-                        and prev_mag > mag and now - last_step_t > STEP_REFRACTORY):
-                    step_count += 1
-                    last_step_t = now
-                    with data_lock:
-                        map_data["current_position"]["x"] += step_len * math.sin(heading)
-                        map_data["current_position"]["y"] += step_len * math.cos(heading)
-                        pos = {k: round(v, 2) for k, v in map_data["current_position"].items()}
-                        map_data["path_history"].append(pos)
-                        save()
-                    print(f"[STEP {step_count}] {math.degrees(heading):.0f}° | {pos}", flush=True)
-
+                
+                is_peak = (prev_mag > STEP_THRESHOLD and prev_mag >= prev_prev_mag and prev_mag > mag and now - last_step_t > STEP_REFRACTORY)
+                if is_peak:
+                    if rate_dps >= TURN_RATE_LIMIT:
+                        print(f"[skip] turning at {rate_dps:.0f} dps", flush=True)
+                    else:
+                        step_count += 1
+                        last_step_t = now
+                        with data_lock:
+                            map_data["current_position"]["x"] += step_len * math.sin(heading)
+                            map_data["current_position"]["y"] += step_len * math.cos(heading)
+                            pos = {k: round(v, 2) for k, v in map_data["current_position"].items()}
+                            map_data["path_history"].append(pos)
+                            save()
+                        print(f"[STEP {step_count}] {math.degrees(heading):.0f}° | {pos}", flush=True)
+               
                 prev_prev_mag, prev_mag = prev_mag, mag
 
             if now - last_report >= 1.0:
