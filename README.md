@@ -73,39 +73,118 @@ conda activate tetris
 Install the required packages:
 
 ```bash
-python -m pip install opencv-python mediapipe numpy ultralytics google-genai
+python -m pip install opencv-python mediapipe numpy ultralytics
+python -m pip install --upgrade mlx-vlm torch torchvision transformers pillow
 ```
 
-Download the YOLOE model once:
+Run the bridged Qwen 4B + SigLIP detector and hand guidance on an Apple Silicon
+Mac. The first run downloads both models; later runs use the local cache:
 
 ```bash
 cd hand_object_detection
-python -c "from ultralytics import YOLOE; YOLOE('yoloe-26n-seg.pt')"
-```
-
-Run on a laptop with an outward-facing camera:
-
-```bash
 python hand_orientation.py \
   --laptop \
   --camera-facing away \
-  --object "pasta box" \
+  --object "soup can" \
   --speak-guidance
 ```
+
+Qwen searches until it confirms the first object box, and SigLIP verifies the
+category. Detection runs in the background so the camera and MediaPipe hand
+tracking remain responsive. The confirmed box is retained while the user
+reaches; object detection is re-armed only after the tracked hand disappears.
 
 Use `--camera 1`, `--camera 2`, and so on to select another camera. Object
 names containing spaces must be enclosed in quotes.
 
-Run on a Raspberry Pi after installing compatible dependencies:
+The Qwen backend uses Apple MLX and cannot run on Raspberry Pi. To run the
+guidance loop on a Pi after installing compatible MediaPipe and Ultralytics
+dependencies, select the retained YOLOE fallback:
 
 ```bash
 cd ~/180DATeam4/hand_object_detection
 python hand_orientation.py \
   --pi \
+  --object-detector yoloe \
   --camera-facing away \
   --object "pasta box" \
   --speak-guidance
 ```
+
+### Split Pi hand guidance and computer object detection
+
+For the intended two-device architecture, connect the Logitech camera to the
+Pi. The Pi keeps each frame for MediaPipe hand tracking and sends a 960-pixel
+JPEG copy over the private USB-network link. The computer runs Qwen + SigLIP
+and optionally verifies branded-product text with Apple Vision OCR before
+returning a normalized bounding box. The Pi caches that box for guidance and
+requests another detection only after the hand disappears.
+
+Start the detector on the computer, using the computer's USB-interface IP:
+
+```bash
+cd /Users/jiali/180DATeam4/hand_object_detection
+conda activate tetris
+
+python object_detection_server.py \
+  --host 10.12.194.2 \
+  --object "cereal"
+```
+
+For an exact branded product, require the existing macOS Vision OCR verifier:
+
+```bash
+python object_detection_server.py \
+  --host 10.12.194.2 \
+  --object "Campbell's soup" \
+  --ocr-verify
+```
+
+OCR is intentionally optional: use it for targets with distinctive visible
+brand or product text, but leave it off for generic targets such as `cereal`
+or `reusable bottle`. If the Vision Python bridge is missing, install it in the
+Mac environment with `python -m pip install pyobjc-framework-Vision`.
+
+Then start hand guidance on the Pi with the same object name:
+
+```bash
+cd ~/180DATeam4/hand_object_detection
+conda activate tetris
+
+python hand_orientation.py \
+  --pi \
+  --camera 0 \
+  --camera-facing away \
+  --object-detector remote \
+  --remote-url http://10.12.194.2:8000/detect \
+  --object "cereal" \
+  --speak-guidance \
+  --no-local-display
+```
+
+Replace `10.12.194.2` if the computer has a different address on the USB
+interface. The computer opens a live debug window showing the Pi's annotated
+camera feed, hand landmarks, returned object box, and current guidance. Press
+`q` in that window to stop the computer server; stop the Pi process with
+Ctrl-C. Use `--no-preview` on the computer only when no debug window is needed.
+
+To start both processes from one Mac command instead, run:
+
+```bash
+cd /Users/jiali/180DATeam4/hand_object_detection
+bash start_pi_hand_guidance.sh "cereal"
+```
+
+Enable Apple Vision OCR from the combined launcher for a branded product:
+
+```bash
+bash start_pi_hand_guidance.sh "Campbell's soup" --ocr
+```
+
+The launcher starts the computer server, waits for the models to become ready,
+then starts the Pi process over SSH. It uses computer USB IP `10.12.194.2`, Pi
+address `piuser@10.12.194.1`, and the existing Pi Conda environment by default.
+Press Ctrl-C in the terminal to stop the combined run.
 
 Press `q` or Escape to close the camera display. When finished:
 

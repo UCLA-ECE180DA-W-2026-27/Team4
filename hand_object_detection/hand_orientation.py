@@ -7,19 +7,27 @@ Coordinate convention follows OpenCV's camera frame:
 * +Y: camera-up
 * +Z: forward from the camera into the scene
 
-MediaPipe tracks the palm. YOLOE-26 detects a selected object from a text
-prompt and draws its bounding box. The Logitech C270 is a monocular RGB camera,
-not a depth camera, so both positions are estimates rather than direct or
-safety-grade distance measurements.
+MediaPipe tracks the palm. By default, local Qwen 4B grounds a generic object
+from a text prompt and SigLIP verifies the proposed crop; YOLOE-26 remains an
+optional fallback. In remote mode, the Pi retains the camera feed for hand
+tracking while sending JPEG frames to a computer that returns a normalized
+object box. The Logitech C270 is a monocular RGB camera, not a depth camera, so
+both positions are estimates rather than direct or safety-grade distance
+measurements.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -43,6 +51,18 @@ DEFAULT_OBJECT_NMS_THRESHOLD = 0.45
 DEFAULT_OBJECT_INPUT_SIZE = 320
 DEFAULT_OBJECT_DETECTION_INTERVAL = 3
 DEFAULT_GUIDANCE_RADIUS_FRACTION = 0.075
+DEFAULT_QWEN_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+DEFAULT_QWEN_UPLOAD_WIDTH = 960
+DEFAULT_QWEN_MAX_NEW_TOKENS = 64
+DEFAULT_SIGLIP_MODEL = "google/siglip2-base-patch16-224"
+DEFAULT_OCR_FUZZY_THRESHOLD = 0.74
+DEFAULT_OCR_MIN_CONFIDENCE = 0.25
+DEFAULT_REMOTE_UPLOAD_WIDTH = 960
+DEFAULT_REMOTE_JPEG_QUALITY = 85
+DEFAULT_REMOTE_TIMEOUT_SECONDS = 15.0
+DEFAULT_REMOTE_PREVIEW_WIDTH = 960
+DEFAULT_REMOTE_PREVIEW_JPEG_QUALITY = 70
+DEFAULT_REMOTE_PREVIEW_INTERVAL = 3
 SPEECH_CHANGE_BUFFER_SECONDS = 1.8
 MAX_CAMERA_READ_FAILURES = 30
 CAMERA_RETRY_DELAY_SECONDS = 0.1
@@ -51,6 +71,7 @@ PI_LOGITECH_CAMERA_INDEX = 0
 LOGITECH_FRAME_WIDTH = 1280
 LOGITECH_FRAME_HEIGHT = 720
 LOGITECH_FRAME_RATE = 30
+STATUS_PANEL_HEIGHT = 250
 
 WRIST = 0
 INDEX_MCP = 5
@@ -103,7 +124,7 @@ class ObjectDetection:
     """One object detection in raw-camera pixel coordinates."""
 
     box: tuple[int, int, int, int]
-    confidence: float
+    confidence: float | None
 
 
 class GuidanceSpeaker:
@@ -259,6 +280,285 @@ class YoloE26ObjectDetector:
             box=(left, top, right - left, bottom - top),
             confidence=float(confidences[best_index]),
         )
+
+
+class QwenSiglipObjectDetector:
+    """Ground an object with Qwen and verify its crop with SigLIP and OCR."""
+
+    def __init__(
+        self,
+        target_name: str,
+        model_id: str,
+        upload_width: int,
+        max_new_tokens: int,
+        siglip_model_id: str,
+        siglip_min_margin: float,
+        ocr_verify: bool = False,
+        ocr_fuzzy_threshold: float = DEFAULT_OCR_FUZZY_THRESHOLD,
+        ocr_min_confidence: float = DEFAULT_OCR_MIN_CONFIDENCE,
+    ) -> None:
+        try:
+            from qwen_mlx_batch_check import SiglipCropVerifier
+            from qwen_mlx_video_check import (
+                LocalMlxQwenDetector,
+                MacVisionTextVerifier,
+            )
+            from qwen_video_check import pixel_box
+        except ImportError as error:
+            raise RuntimeError(
+                "Qwen + SigLIP guidance requires mlx-vlm, torch, transformers, "
+                "and Pillow. See the README setup instructions."
+            ) from error
+
+        self.target_name = target_name
+        self._pixel_box = pixel_box
+        self.ocr_enabled = ocr_verify
+        self.last_ocr_match: bool | None = None
+        self.last_ocr_text: str | None = None
+        print(f"Loading local Qwen detector: {model_id}")
+        self._qwen = LocalMlxQwenDetector(
+            model_id=model_id,
+            upload_width=upload_width,
+            max_new_tokens=max_new_tokens,
+        )
+        print(f"Qwen loaded in {self._qwen.load_seconds:.2f}s.")
+        print(f"Loading SigLIP verifier: {siglip_model_id}")
+        self._siglip = SiglipCropVerifier(
+            model_id=siglip_model_id,
+            minimum_margin=siglip_min_margin,
+        )
+        print(
+            f"SigLIP loaded and warmed on {self._siglip.device} in "
+            f"{self._siglip.load_seconds:.2f}s."
+        )
+        self._ocr = None
+        if ocr_verify:
+            self._ocr = MacVisionTextVerifier(
+                fuzzy_threshold=ocr_fuzzy_threshold,
+                min_confidence=ocr_min_confidence,
+            )
+            print(
+                "Apple Vision OCR verification enabled "
+                f"(fuzzy threshold {ocr_fuzzy_threshold:.2f}, "
+                f"minimum confidence {ocr_min_confidence:.2f})."
+            )
+
+    def detect(self, frame: np.ndarray) -> ObjectDetection | None:
+        """Return the first box accepted by SigLIP and optional Vision OCR."""
+        self.last_ocr_match = None
+        self.last_ocr_text = None
+        detections, _, _, _, _ = self._qwen.detect(
+            frame,
+            self.target_name,
+            target_type="specific" if self.ocr_enabled else "generic",
+        )
+        if not detections:
+            return None
+
+        candidate = detections[0]
+        verification = self._siglip.verify(
+            frame,
+            candidate,
+            self.target_name,
+            (self.target_name,),
+        )
+        if not verification.matched:
+            return None
+
+        if self._ocr is not None:
+            self.last_ocr_match, self.last_ocr_text = self._ocr.verify(
+                frame,
+                candidate,
+                self.target_name,
+            )
+            readable_text = self.last_ocr_text or "<no text read>"
+            decision = "accepted" if self.last_ocr_match else "rejected"
+            print(f"Apple Vision OCR {decision}: {readable_text}")
+            if not self.last_ocr_match:
+                return None
+
+        frame_height, frame_width = frame.shape[:2]
+        left, top, right, bottom = self._pixel_box(
+            candidate.box_2d,
+            frame_width,
+            frame_height,
+        )
+        return ObjectDetection(
+            box=(left, top, right - left, bottom - top),
+            # Qwen and SigLIP scores are not calibrated detection confidence.
+            confidence=None,
+        )
+
+
+class RemoteObjectDetector:
+    """Send Pi camera frames to a computer and receive normalized boxes."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        target_name: str,
+        upload_width: int,
+        jpeg_quality: int,
+        timeout_seconds: float,
+    ) -> None:
+        parsed_endpoint = urllib.parse.urlparse(endpoint)
+        if parsed_endpoint.scheme not in ("http", "https"):
+            raise RuntimeError("Remote detector URL must begin with http:// or https://")
+        if not parsed_endpoint.netloc:
+            raise RuntimeError("Remote detector URL must include a host and port")
+
+        self.endpoint = endpoint
+        self.target_name = target_name
+        self.upload_width = upload_width
+        self.jpeg_quality = jpeg_quality
+        self.timeout_seconds = timeout_seconds
+
+    def detect(self, frame: np.ndarray) -> ObjectDetection | None:
+        """Upload one frame and convert the returned normalized box to pixels."""
+        frame_height, frame_width = frame.shape[:2]
+        if frame_width > self.upload_width:
+            upload_height = max(
+                1,
+                int(round(frame_height * self.upload_width / frame_width)),
+            )
+            upload_frame = cv2.resize(
+                frame,
+                (self.upload_width, upload_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            upload_frame = frame
+
+        encoded_ok, encoded_frame = cv2.imencode(
+            ".jpg",
+            upload_frame,
+            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+        )
+        if not encoded_ok:
+            raise RuntimeError("Could not encode the camera frame as JPEG")
+
+        query = urllib.parse.urlencode({"object": self.target_name})
+        separator = "&" if urllib.parse.urlparse(self.endpoint).query else "?"
+        request = urllib.request.Request(
+            f"{self.endpoint}{separator}{query}",
+            data=encoded_frame.tobytes(),
+            headers={"Content-Type": "image/jpeg"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.timeout_seconds,
+            ) as response:
+                payload = json.load(response)
+        except urllib.error.HTTPError as error:
+            try:
+                details = error.read().decode("utf-8", errors="replace")
+            except OSError:
+                details = str(error)
+            raise RuntimeError(
+                f"Computer detector returned HTTP {error.code}: {details}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(
+                f"Could not reach computer detector at {self.endpoint}: "
+                f"{error.reason}"
+            ) from error
+
+        status = payload.get("status")
+        if status == "not_detected":
+            return None
+        if status != "detected":
+            raise RuntimeError(
+                f"Computer detector returned an invalid status: {status!r}"
+            )
+
+        normalized_box = payload.get("bbox_normalized")
+        if not isinstance(normalized_box, list) or len(normalized_box) != 4:
+            raise RuntimeError(
+                "Computer detector response must contain four normalized box values"
+            )
+        try:
+            normalized_left, normalized_top, normalized_right, normalized_bottom = (
+                float(value) for value in normalized_box
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Computer detector returned non-numeric box coordinates"
+            ) from error
+
+        left = max(0, min(int(round(normalized_left * frame_width)), frame_width - 1))
+        top = max(0, min(int(round(normalized_top * frame_height)), frame_height - 1))
+        right = max(left + 1, min(int(round(normalized_right * frame_width)), frame_width))
+        bottom = max(
+            top + 1,
+            min(int(round(normalized_bottom * frame_height)), frame_height),
+        )
+        return ObjectDetection(
+            box=(left, top, right - left, bottom - top),
+            confidence=None,
+        )
+
+
+class RemotePreviewSender:
+    """Send annotated Pi frames to the computer for visual debugging."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        upload_width: int,
+        jpeg_quality: int,
+        timeout_seconds: float,
+    ) -> None:
+        parsed_endpoint = urllib.parse.urlparse(endpoint)
+        if parsed_endpoint.scheme not in ("http", "https"):
+            raise RuntimeError("Remote preview URL must begin with http:// or https://")
+        if not parsed_endpoint.netloc:
+            raise RuntimeError("Remote preview URL must include a host and port")
+        self.endpoint = endpoint
+        self.upload_width = upload_width
+        self.jpeg_quality = jpeg_quality
+        self.timeout_seconds = timeout_seconds
+
+    def send(self, frame: np.ndarray) -> None:
+        """Upload one annotated display frame without waiting for a response body."""
+        frame_height, frame_width = frame.shape[:2]
+        if frame_width > self.upload_width:
+            upload_height = max(
+                1,
+                int(round(frame_height * self.upload_width / frame_width)),
+            )
+            upload_frame = cv2.resize(
+                frame,
+                (self.upload_width, upload_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            upload_frame = frame
+        encoded_ok, encoded_frame = cv2.imencode(
+            ".jpg",
+            upload_frame,
+            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+        )
+        if not encoded_ok:
+            raise RuntimeError("Could not encode the debug preview as JPEG")
+
+        request = urllib.request.Request(
+            self.endpoint,
+            data=encoded_frame.tobytes(),
+            headers={"Content-Type": "image/jpeg"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.timeout_seconds,
+            ):
+                pass
+        except urllib.error.URLError as error:
+            raise RuntimeError(
+                f"Could not send debug preview to {self.endpoint}: {error.reason}"
+            ) from error
 
 
 def palm_size_fraction(
@@ -531,14 +831,14 @@ def guidance_text(
     directions: list[str] = []
     axis_deadband = max(1.0, alignment_radius * 0.35)
     if delta_x < -axis_deadband:
-        directions.append("RIGHT")
-    elif delta_x > axis_deadband:
         directions.append("LEFT")
+    elif delta_x > axis_deadband:
+        directions.append("RIGHT")
     if abs(delta_y) > alignment_radius:
         directions.append("UP" if delta_y < 0 else "DOWN")
 
     if not directions:
-        directions.append("RIGHT" if delta_x < 0 else "LEFT")
+        directions.append("LEFT" if delta_x < 0 else "RIGHT")
     return "MOVE HAND: " + " | ".join(directions), False
 
 
@@ -642,7 +942,9 @@ def draw_object_box(
     color = (0, 220, 255) if cached else (80, 255, 80)
     cv2.rectangle(frame, (left, top), (right, bottom), color, 3, cv2.LINE_AA)
     cv2.circle(frame, center, 9, color, -1, cv2.LINE_AA)
-    label = f"{target_name} {detection.confidence:.0%}"
+    label = target_name
+    if detection.confidence is not None:
+        label += f" {detection.confidence:.0%}"
     if cached:
         label += " (last known)"
     if object_xyz is not None:
@@ -749,10 +1051,19 @@ def parse_args() -> argparse.Namespace:
         help="Path to the MediaPipe hand_landmarker.task model",
     )
     parser.add_argument(
+        "--object-detector",
+        choices=("qwen-siglip", "remote", "yoloe"),
+        default="qwen-siglip",
+        help=(
+            "Object detector: local Qwen 4B plus SigLIP on Apple Silicon "
+            "(default), remote computer detection, or YOLOE-26"
+        ),
+    )
+    parser.add_argument(
         "--object-model",
         type=Path,
         default=DEFAULT_OBJECT_MODEL_PATH,
-        help="Path to a YOLOE-26 segmentation .pt checkpoint",
+        help="Path to a YOLOE-26 segmentation .pt checkpoint when using yoloe",
     )
     parser.add_argument(
         "--object",
@@ -789,6 +1100,108 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_OBJECT_DETECTION_INTERVAL,
         help="Run object detection every N camera frames (default: 3)",
+    )
+    parser.add_argument(
+        "--qwen-model",
+        default=DEFAULT_QWEN_MODEL,
+        help="MLX Qwen checkpoint used by qwen-siglip",
+    )
+    parser.add_argument(
+        "--qwen-upload-width",
+        type=int,
+        default=DEFAULT_QWEN_UPLOAD_WIDTH,
+        help="Image width sent to Qwen (default: 960)",
+    )
+    parser.add_argument(
+        "--qwen-max-new-tokens",
+        type=int,
+        default=DEFAULT_QWEN_MAX_NEW_TOKENS,
+        help="Maximum Qwen response tokens (default: 64)",
+    )
+    parser.add_argument(
+        "--siglip-model",
+        default=DEFAULT_SIGLIP_MODEL,
+        help="SigLIP checkpoint used to verify Qwen's crop",
+    )
+    parser.add_argument(
+        "--siglip-min-margin",
+        type=float,
+        default=0.0,
+        help="Required SigLIP target margin over competing categories",
+    )
+    parser.add_argument(
+        "--ocr-verify",
+        action="store_true",
+        help="Verify a branded product using Apple Vision OCR (macOS only)",
+    )
+    parser.add_argument(
+        "--ocr-fuzzy-threshold",
+        type=float,
+        default=DEFAULT_OCR_FUZZY_THRESHOLD,
+        help="OCR target-word similarity threshold (default: 0.74)",
+    )
+    parser.add_argument(
+        "--ocr-min-confidence",
+        type=float,
+        default=DEFAULT_OCR_MIN_CONFIDENCE,
+        help="Minimum Apple Vision text confidence (default: 0.25)",
+    )
+    parser.add_argument(
+        "--remote-url",
+        default=None,
+        help=(
+            "Computer detection endpoint when using --object-detector remote, "
+            "for example http://10.12.194.2:8000/detect"
+        ),
+    )
+    parser.add_argument(
+        "--remote-upload-width",
+        type=int,
+        default=DEFAULT_REMOTE_UPLOAD_WIDTH,
+        help="JPEG width sent to the computer (default: 960)",
+    )
+    parser.add_argument(
+        "--remote-jpeg-quality",
+        type=int,
+        default=DEFAULT_REMOTE_JPEG_QUALITY,
+        help="JPEG quality sent to the computer from 1 to 100 (default: 85)",
+    )
+    parser.add_argument(
+        "--remote-timeout",
+        type=float,
+        default=DEFAULT_REMOTE_TIMEOUT_SECONDS,
+        help="Computer detection request timeout in seconds (default: 15)",
+    )
+    parser.add_argument(
+        "--remote-preview-url",
+        default=None,
+        help=(
+            "Computer debug-preview endpoint; defaults to /preview on the "
+            "same host as --remote-url"
+        ),
+    )
+    parser.add_argument(
+        "--remote-preview-width",
+        type=int,
+        default=DEFAULT_REMOTE_PREVIEW_WIDTH,
+        help="Width of the annotated laptop preview (default: 960)",
+    )
+    parser.add_argument(
+        "--remote-preview-jpeg-quality",
+        type=int,
+        default=DEFAULT_REMOTE_PREVIEW_JPEG_QUALITY,
+        help="Debug-preview JPEG quality from 1 to 100 (default: 70)",
+    )
+    parser.add_argument(
+        "--remote-preview-every",
+        type=int,
+        default=DEFAULT_REMOTE_PREVIEW_INTERVAL,
+        help="Send one debug-preview frame every N camera frames (default: 3)",
+    )
+    parser.add_argument(
+        "--no-local-display",
+        action="store_true",
+        help="Do not open an OpenCV window on the Pi; quit with Ctrl-C",
     )
     parser.add_argument(
         "--guidance-radius",
@@ -853,6 +1266,30 @@ def parse_args() -> argparse.Namespace:
         parser.error("--object-input-size must be greater than zero")
     if args.object_every <= 0:
         parser.error("--object-every must be greater than zero")
+    if args.qwen_upload_width <= 0:
+        parser.error("--qwen-upload-width must be greater than zero")
+    if args.qwen_max_new_tokens <= 0:
+        parser.error("--qwen-max-new-tokens must be greater than zero")
+    if args.siglip_min_margin < 0.0:
+        parser.error("--siglip-min-margin cannot be negative")
+    if not 0.0 <= args.ocr_fuzzy_threshold <= 1.0:
+        parser.error("--ocr-fuzzy-threshold must be between 0 and 1")
+    if not 0.0 <= args.ocr_min_confidence <= 1.0:
+        parser.error("--ocr-min-confidence must be between 0 and 1")
+    if args.remote_upload_width <= 0:
+        parser.error("--remote-upload-width must be greater than zero")
+    if not 1 <= args.remote_jpeg_quality <= 100:
+        parser.error("--remote-jpeg-quality must be between 1 and 100")
+    if args.remote_timeout <= 0.0:
+        parser.error("--remote-timeout must be greater than zero")
+    if args.remote_preview_width <= 0:
+        parser.error("--remote-preview-width must be greater than zero")
+    if not 1 <= args.remote_preview_jpeg_quality <= 100:
+        parser.error("--remote-preview-jpeg-quality must be between 1 and 100")
+    if args.remote_preview_every <= 0:
+        parser.error("--remote-preview-every must be greater than zero")
+    if args.object_detector == "remote" and not args.remote_url:
+        parser.error("--remote-url is required with --object-detector remote")
     if not 0.0 < args.guidance_radius <= 0.5:
         parser.error("--guidance-radius must be greater than 0 and at most 0.5")
     if args.camera is not None and args.camera < 0:
@@ -869,7 +1306,7 @@ def main() -> None:
             f"MediaPipe model not found: {hand_model_path}\n"
             "Place hand_landmarker.task beside this script or pass --model PATH."
         )
-    if not object_model_path.is_file():
+    if args.object_detector == "yoloe" and not object_model_path.is_file():
         raise SystemExit(
             f"Object model not found: {object_model_path}\n"
             "Place yoloe-26n-seg.pt beside this script or pass "
@@ -881,18 +1318,67 @@ def main() -> None:
         args.object_width_cm,
     )
 
-    try:
-        object_detector = YoloE26ObjectDetector(
-            object_model_path,
-            target_name,
-            args.object_input_size,
-            args.object_confidence,
-            args.object_nms_threshold,
+    if args.object_detector == "qwen-siglip" and args.computer == "pi":
+        raise SystemExit(
+            "Qwen + SigLIP uses Apple MLX and cannot run on Raspberry Pi. "
+            "Use --object-detector remote to call the computer, or use YOLOE."
         )
+
+    try:
+        if args.object_detector == "qwen-siglip":
+            object_detector = QwenSiglipObjectDetector(
+                target_name=target_name,
+                model_id=args.qwen_model,
+                upload_width=args.qwen_upload_width,
+                max_new_tokens=args.qwen_max_new_tokens,
+                siglip_model_id=args.siglip_model,
+                siglip_min_margin=args.siglip_min_margin,
+                ocr_verify=args.ocr_verify,
+                ocr_fuzzy_threshold=args.ocr_fuzzy_threshold,
+                ocr_min_confidence=args.ocr_min_confidence,
+            )
+        elif args.object_detector == "remote":
+            object_detector = RemoteObjectDetector(
+                endpoint=args.remote_url,
+                target_name=target_name,
+                upload_width=args.remote_upload_width,
+                jpeg_quality=args.remote_jpeg_quality,
+                timeout_seconds=args.remote_timeout,
+            )
+            print(f"Computer object detector: {args.remote_url}")
+        else:
+            object_detector = YoloE26ObjectDetector(
+                object_model_path,
+                target_name,
+                args.object_input_size,
+                args.object_confidence,
+                args.object_nms_threshold,
+            )
     except Exception as error:
         raise SystemExit(
-            f"Could not initialize YOLOE-26: {object_model_path}\n{error}"
+            f"Could not initialize {args.object_detector} object detector:\n{error}"
         ) from error
+
+    remote_preview_sender: RemotePreviewSender | None = None
+    if args.object_detector == "remote":
+        if args.remote_preview_url:
+            remote_preview_url = args.remote_preview_url
+        else:
+            parsed_remote_url = urllib.parse.urlparse(args.remote_url)
+            remote_preview_url = urllib.parse.urlunparse(
+                parsed_remote_url._replace(
+                    path="/preview",
+                    query="",
+                    fragment="",
+                )
+            )
+        remote_preview_sender = RemotePreviewSender(
+            endpoint=remote_preview_url,
+            upload_width=args.remote_preview_width,
+            jpeg_quality=args.remote_preview_jpeg_quality,
+            timeout_seconds=min(args.remote_timeout, 2.0),
+        )
+        print(f"Laptop debug preview: {remote_preview_url}")
 
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(hand_model_path)),
@@ -958,6 +1444,22 @@ def main() -> None:
     frame_number = 0
     object_detection: ObjectDetection | None = None
     object_visible = False
+    object_detector_error: str | None = None
+    object_search_enabled = True
+    previous_hand_visible = False
+    object_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="object-detection",
+    )
+    object_future: Future[ObjectDetection | None] | None = None
+    preview_executor: ThreadPoolExecutor | None = None
+    preview_future: Future[None] | None = None
+    last_preview_error: str | None = None
+    if remote_preview_sender is not None:
+        preview_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="debug-preview",
+        )
     guidance_speaker: GuidanceSpeaker | None = None
     if args.speak_guidance:
         try:
@@ -996,28 +1498,78 @@ def main() -> None:
                 previous_timestamp_ms = timestamp_ms
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-                object_detection_ran = frame_number % args.object_every == 0
-                if object_detection_ran:
-                    current_object_detection = object_detector.detect(camera_frame)
-                    object_visible = current_object_detection is not None
-                    if current_object_detection is not None:
-                        object_detection = current_object_detection
-                frame_number += 1
-
-                if mirrored_display:
-                    display_frame = cv2.flip(camera_frame, 1)
-                else:
-                    display_frame = camera_frame.copy()
-
-                cv2.rectangle(display_frame, (0, 0), (width, 220), (25, 25, 25), -1)
-                draw_optical_center(display_frame)
-
                 selected_index, selected_size = select_foreground_hand(
                     result.hand_landmarks,
                     width,
                     height,
                     args.min_hand_size,
                 )
+                hand_visible = selected_index is not None
+                hand_disappeared = previous_hand_visible and not hand_visible
+                previous_hand_visible = hand_visible
+                if hand_disappeared and object_detection is not None:
+                    object_search_enabled = True
+                    object_visible = False
+                    print("Hand disappeared; object detection re-armed.")
+
+                # Qwen takes roughly two seconds, so inference runs in a worker
+                # while camera and hand tracking remain responsive. After the
+                # first confirmed box, it is only re-armed by hand disappearance.
+                object_detection_ran = False
+                if object_future is not None and object_future.done():
+                    object_detection_ran = True
+                    try:
+                        current_object_detection = object_future.result()
+                        object_detector_error = None
+                        object_visible = current_object_detection is not None
+                        if current_object_detection is not None:
+                            object_detection = current_object_detection
+                            object_search_enabled = False
+                    except Exception as error:
+                        object_visible = False
+                        object_detector_error = str(error)
+                        print(f"Object detection failed: {error}")
+                    object_future = None
+
+                may_search_current_frame = (
+                    object_detection is None or not hand_visible
+                )
+                if (
+                    object_future is None
+                    and object_search_enabled
+                    and may_search_current_frame
+                    and (
+                        hand_disappeared
+                        or frame_number % args.object_every == 0
+                    )
+                ):
+                    object_future = object_executor.submit(
+                        object_detector.detect,
+                        camera_frame.copy(),
+                    )
+                frame_number += 1
+
+                if mirrored_display:
+                    camera_display_frame = cv2.flip(camera_frame, 1)
+                else:
+                    camera_display_frame = camera_frame.copy()
+
+                # Build the final canvas first, then expose only the lower
+                # camera region to every visual-annotation function. This
+                # makes it impossible for boxes or landmarks to enter the
+                # status panel even though their coordinates start at y=0.
+                display_frame = np.full(
+                    (height + STATUS_PANEL_HEIGHT, width, 3),
+                    (25, 25, 25),
+                    dtype=np.uint8,
+                )
+                camera_display_region = display_frame[
+                    STATUS_PANEL_HEIGHT : STATUS_PANEL_HEIGHT + height,
+                    :width,
+                ]
+                camera_display_region[:] = camera_display_frame
+
+                draw_optical_center(camera_display_region)
 
                 palm_xyz: np.ndarray | None = None
                 palm_display_center: tuple[int, int] | None = None
@@ -1039,7 +1591,7 @@ def main() -> None:
                         mirrored_display,
                     )
                     draw_hand_and_palm_center(
-                        display_frame,
+                        camera_display_region,
                         image_landmarks,
                         palm_center,
                         mirrored_display,
@@ -1081,6 +1633,11 @@ def main() -> None:
                 object_camera_center: tuple[int, int] | None = None
                 object_status = f"OBJECT ({target_name}): not detected"
                 if object_detection is not None:
+                    confidence_suffix = (
+                        ""
+                        if object_detection.confidence is None
+                        else f" ({object_detection.confidence:.0%})"
+                    )
                     object_camera_center = _display_object_center(
                         object_detection,
                         width,
@@ -1095,8 +1652,7 @@ def main() -> None:
                         object_position_smoother.reset()
                         if object_visible:
                             object_status = (
-                                "OBJECT DETECTED "
-                                f"({object_detection.confidence:.0%}); "
+                                f"OBJECT DETECTED{confidence_suffix}; "
                                 "XYZ unavailable without width"
                             )
                         else:
@@ -1119,8 +1675,8 @@ def main() -> None:
                                 object_status = (
                                     f"OBJECT XYZ: {object_xyz[0]:+.2f}, "
                                     f"{object_xyz[1]:+.2f}, "
-                                    f"{object_xyz[2]:+.2f} m "
-                                    f"({object_detection.confidence:.0%})"
+                                    f"{object_xyz[2]:+.2f} m"
+                                    f"{confidence_suffix}"
                                 )
                             else:
                                 object_status = (
@@ -1132,7 +1688,7 @@ def main() -> None:
                                 f"OBJECT ({target_name}): XYZ unavailable"
                             )
                     draw_object_box(
-                        display_frame,
+                        camera_display_region,
                         object_detection,
                         target_name,
                         object_xyz,
@@ -1141,6 +1697,12 @@ def main() -> None:
                     )
                 else:
                     object_position_smoother.reset()
+                    if object_detector_error is not None:
+                        object_status = "OBJECT DETECTOR ERROR: see terminal"
+                    elif object_future is not None:
+                        object_status = f"OBJECT ({target_name}): searching"
+
+                status_y = 0
 
                 target_label = f"TARGET: {target_name}"
                 if target_width_meters is not None:
@@ -1148,21 +1710,21 @@ def main() -> None:
                 _draw_text(
                     display_frame,
                     target_label,
-                    28,
+                    status_y + 28,
                     (255, 255, 255),
                     0.66,
                 )
                 _draw_text(
                     display_frame,
                     palm_status,
-                    60,
+                    status_y + 60,
                     (80, 255, 80) if palm_xyz is not None else (0, 165, 255),
                     0.62,
                 )
                 _draw_text(
                     display_frame,
                     object_status,
-                    92,
+                    status_y + 92,
                     (
                         (80, 255, 80)
                         if object_visible
@@ -1203,8 +1765,10 @@ def main() -> None:
                     )
 
                 if object_display_center is not None:
+                    # Draw through the camera-only view so a large alignment
+                    # circle is clipped at the status-panel boundary.
                     cv2.circle(
-                        display_frame,
+                        camera_display_region,
                         object_display_center,
                         alignment_radius_pixels,
                         (80, 255, 80) if aligned else (0, 220, 255),
@@ -1214,7 +1778,7 @@ def main() -> None:
                 _draw_text(
                     display_frame,
                     guidance,
-                    132,
+                    status_y + 132,
                     (80, 255, 80) if aligned else (0, 220, 255),
                     0.72,
                 )
@@ -1223,7 +1787,7 @@ def main() -> None:
                     _draw_text(
                         display_frame,
                         "OBJECT XYZ/DISTANCE: disabled because width was skipped",
-                        170,
+                        status_y + 170,
                         (225, 225, 225),
                         0.58,
                     )
@@ -1232,7 +1796,7 @@ def main() -> None:
                     _draw_text(
                         display_frame,
                         f"PALM-OBJECT DISTANCE: {distance:.2f} m",
-                        170,
+                        status_y + 170,
                         (225, 225, 225),
                         0.58,
                     )
@@ -1249,7 +1813,7 @@ def main() -> None:
                     _draw_text(
                         display_frame,
                         "PALM-OBJECT DISTANCE: waiting for both XYZ estimates",
-                        170,
+                        status_y + 170,
                         (0, 165, 255),
                         0.58,
                     )
@@ -1257,29 +1821,66 @@ def main() -> None:
                 _draw_text(
                     display_frame,
                     "Axes: +X left, +Y up, +Z forward; origin at camera lens",
-                    204,
+                    status_y + 204,
                     (210, 210, 210),
                     0.54,
                 )
 
                 cv2.putText(
                     display_frame,
-                    "Approximate monocular XYZ - press Q or Esc to quit",
-                    (18, height - 18),
+                    (
+                        "Approximate monocular XYZ - press Q or Esc to quit"
+                        if not args.no_local_display
+                        else "Approximate monocular XYZ - Ctrl-C to quit"
+                    ),
+                    (18, status_y + 236),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
                     (230, 230, 230),
                     1,
                     cv2.LINE_AA,
                 )
-                cv2.imshow(window_name, display_frame)
+                cv2.line(
+                    display_frame,
+                    (0, STATUS_PANEL_HEIGHT - 1),
+                    (width - 1, STATUS_PANEL_HEIGHT - 1),
+                    (110, 110, 110),
+                    2,
+                    cv2.LINE_AA,
+                )
 
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
-                    break
+                if preview_future is not None and preview_future.done():
+                    try:
+                        preview_future.result()
+                        last_preview_error = None
+                    except Exception as error:
+                        preview_error = str(error)
+                        if preview_error != last_preview_error:
+                            print(f"Debug preview unavailable: {preview_error}")
+                        last_preview_error = preview_error
+                    preview_future = None
+                if (
+                    remote_preview_sender is not None
+                    and preview_executor is not None
+                    and preview_future is None
+                    and frame_number % args.remote_preview_every == 0
+                ):
+                    preview_future = preview_executor.submit(
+                        remote_preview_sender.send,
+                        display_frame.copy(),
+                    )
+
+                if not args.no_local_display:
+                    cv2.imshow(window_name, display_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), 27):
+                        break
     finally:
         if guidance_speaker is not None:
             guidance_speaker.close()
+        if preview_executor is not None:
+            preview_executor.shutdown(wait=True, cancel_futures=True)
+        object_executor.shutdown(wait=True, cancel_futures=True)
         capture.release()
         cv2.destroyAllWindows()
 
