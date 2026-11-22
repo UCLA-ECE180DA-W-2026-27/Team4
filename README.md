@@ -73,116 +73,124 @@ conda activate tetris
 Install the required packages:
 
 ```bash
-python -m pip install opencv-python mediapipe numpy ultralytics google-genai
+python -m pip install opencv-python mediapipe numpy ultralytics
+python -m pip install --upgrade mlx-vlm torch torchvision transformers pillow
 ```
 
-Download the YOLOE model once:
+Run the bridged Qwen 4B + SigLIP detector and hand guidance on an Apple Silicon
+Mac. The first run downloads both models; later runs use the local cache:
 
 ```bash
 cd hand_object_detection
-python -c "from ultralytics import YOLOE; YOLOE('yoloe-26n-seg.pt')"
-```
-
-Run on a laptop with an outward-facing camera:
-
-```bash
 python hand_orientation.py \
   --laptop \
   --camera-facing away \
-  --object "pasta box" \
+  --object "soup can" \
   --speak-guidance
 ```
+
+Qwen searches until it confirms the first object box, and SigLIP verifies the
+category. Detection runs in the background so the camera and MediaPipe hand
+tracking remain responsive. The confirmed box is retained while the user
+reaches; object detection is re-armed only after the tracked hand disappears.
 
 Use `--camera 1`, `--camera 2`, and so on to select another camera. Object
 names containing spaces must be enclosed in quotes.
 
-Run on a Raspberry Pi after installing compatible dependencies:
+The Qwen backend uses Apple MLX and cannot run on Raspberry Pi. To run the
+guidance loop on a Pi after installing compatible MediaPipe and Ultralytics
+dependencies, select the retained YOLOE fallback:
 
 ```bash
 cd ~/180DATeam4/hand_object_detection
 python hand_orientation.py \
   --pi \
+  --object-detector yoloe \
   --camera-facing away \
   --object "pasta box" \
   --speak-guidance
 ```
+
+### Split Pi hand guidance and computer object detection
+
+For the intended two-device architecture, connect the Logitech camera to the
+Pi. The Pi keeps each frame for MediaPipe hand tracking and sends a 960-pixel
+JPEG copy over the private USB-network link. The computer runs Qwen + SigLIP
+and optionally verifies branded-product text with Apple Vision OCR before
+returning a normalized bounding box. The Pi caches that box for guidance and
+requests another detection only after the hand disappears.
+
+Start the detector on the computer, using the computer's USB-interface IP:
+
+```bash
+cd /Users/jiali/180DATeam4/hand_object_detection
+conda activate tetris
+
+python object_detection_server.py \
+  --host 10.12.194.2 \
+  --object "cereal"
+```
+
+For an exact branded product, require the existing macOS Vision OCR verifier:
+
+```bash
+python object_detection_server.py \
+  --host 10.12.194.2 \
+  --object "Campbell's soup" \
+  --ocr-verify
+```
+
+OCR is intentionally optional: use it for targets with distinctive visible
+brand or product text, but leave it off for generic targets such as `cereal`
+or `reusable bottle`. If the Vision Python bridge is missing, install it in the
+Mac environment with `python -m pip install pyobjc-framework-Vision`.
+
+Then start hand guidance on the Pi with the same object name:
+
+```bash
+cd ~/180DATeam4/hand_object_detection
+conda activate tetris
+
+python hand_orientation.py \
+  --pi \
+  --camera 0 \
+  --camera-facing away \
+  --object-detector remote \
+  --remote-url http://10.12.194.2:8000/detect \
+  --object "cereal" \
+  --speak-guidance \
+  --no-local-display
+```
+
+Replace `10.12.194.2` if the computer has a different address on the USB
+interface. The computer opens a live debug window showing the Pi's annotated
+camera feed, hand landmarks, returned object box, and current guidance. Press
+`q` in that window to stop the computer server; stop the Pi process with
+Ctrl-C. Use `--no-preview` on the computer only when no debug window is needed.
+
+To start both processes from one Mac command instead, run:
+
+```bash
+cd /Users/jiali/180DATeam4/hand_object_detection
+bash start_pi_hand_guidance.sh "cereal"
+```
+
+Enable Apple Vision OCR from the combined launcher for a branded product:
+
+```bash
+bash start_pi_hand_guidance.sh "Campbell's soup" --ocr
+```
+
+The launcher starts the computer server, waits for the models to become ready,
+then starts the Pi process over SSH. It uses computer USB IP `10.12.194.2`, Pi
+address `piuser@10.12.194.1`, and the existing Pi Conda environment by default.
+Press Ctrl-C in the terminal to stop the combined run.
 
 Press `q` or Escape to close the camera display. When finished:
 
 ```bash
 conda deactivate
 ```
-
-## Gemini video object-detection benchmark
-
-`hand_object_detection/gemini_video_check.py` sends one complete video frame
-directly to Gemini every two seconds by default. This avoids depending on an
-unreliable YOLOE trigger. Gemini returns only the first valid matching product
-it identifies; it does not rank identical products or choose the clearest,
-largest, closest, or most centered instance. Sampled frames are uploaded to
-Google's Gemini API and may incur API usage charges. The default model is the
-low-latency `gemini-3.5-flash-lite`. This isolated benchmark does not change the
-live hand-guidance pipeline.
-
-To minimize response time and output tokens, Gemini returns only a normalized
-`[ymin, xmin, ymax, xmax]` coordinate array. It returns `[]` when no valid match
-is visible; it does not generate a redundant label or uncalibrated confidence.
-Failed requests are not retried by default because the next scheduled frame is
-more useful for live video than repeatedly analyzing an older frame.
-Uploaded frames use JPEG quality 92 by default to preserve small product-label
-details. Override it with `--jpeg-quality N` for controlled experiments.
-Gemini's media resolution remains unspecified by default. Use
-`--media-resolution medium` to test a smaller visual-token budget without
-resizing the saved source frame.
-Use `--upload-width 1280` to send a 1280×720 copy of a 16:9 frame to Gemini.
-The original full-resolution frame is still used for saved annotations, and
-normalized box coordinates require no rescaling.
-
-Set the API key in the terminal instead of storing it in the repository:
-
-```bash
-export GEMINI_API_KEY="your-api-key-here"
-```
-
-Run a one-frame check first:
-
-```bash
-cd hand_object_detection
-python gemini_video_check.py \
-  --object "Campbell's soup" \
-  --start-seconds 25 \
-  --max-samples 1
-```
-
-If that succeeds, evaluate the complete trimmed video at two-second intervals:
-
-```bash
-python gemini_video_check.py \
-  --object "Campbell's soup" \
-  --sample-every-seconds 2
-```
-
-Direct mode calls Gemini for every readable sampled frame. To compare it with
-the experimental low-confidence YOLOE gate, add `--yolo-gate`:
-
-```bash
-python gemini_video_check.py \
-  --object "Campbell's soup" \
-  --yolo-gate \
-  --yolo-confidence 0.03
-```
-
-In gated mode, a lower threshold lets more possible products reach Gemini but
-can increase API calls. Yellow boxes are YOLOE proposals and green boxes are
-Gemini results. The direct and gated modes use separate output directories.
-
-Use `--video /path/to/video.mp4` to select another recording. Each run writes
-annotated sample images, a sample-review MP4, and `results.json` under
-`hand_object_detection/gemini_video_test_output/`. The review is intentionally
-a slideshow of independently analyzed samples; it does not imply that the
-product is tracked between samples. The report records API calls, retries,
-latency, and detections. The review video opens automatically after processing;
-pass `--no-open` to leave it closed.
 
 ## Local Qwen video object-detection benchmark
 
@@ -318,51 +326,3 @@ python qwen_mlx_video_check.py \
 
 OCR text, match decisions, OCR latency, Qwen candidate boxes, and accepted
 boxes are recorded in `results.json`. This OCR mode is macOS-only.
-
-### Hybrid generic and specific object detection
-
-`hybrid_object_check.py` uses the stationary-frame routing selected for the
-project:
-
-- Generic categories use direct Gemini detection at 1280-pixel upload width.
-- Specific named products use local Qwen at 960-pixel input width followed by
-  macOS Vision OCR verification.
-
-Check several generic and specific targets in one run:
-
-```bash
-cd hand_object_detection
-python hybrid_object_check.py \
-  --generic-objects water cereal "soup can" ham \
-  --specific-objects "Campbell's soup" "StarKist tuna" \
-  --time-seconds 26
-```
-
-The Gemini API key is required only when `--generic-objects` is used. The
-script reuses one Gemini client across generic targets and loads Qwen only once
-across specific targets. It saves one annotated image per target, a combined
-`hybrid_summary.jpg`, and `results.json` with backend selection and latency.
-
-If neither object list is supplied, the script defaults to the four generic
-checks `water`, `cereal`, `soup can`, and `ham`.
-
-To search across the entire video instead of checking one timestamp, use
-`hybrid_video_scan.py`:
-
-```bash
-python hybrid_video_scan.py \
-  --generic-objects water cereal "soup can" ham \
-  --specific-objects "Campbell's soup" "StarKist tuna" \
-  --sample-every-seconds 2
-```
-
-The complete video duration is sampled every two seconds. Each target stops
-using its backend after its first confirmed detection, which avoids unnecessary
-Gemini calls and Qwen inferences. The scan saves the first confirmed image for
-each found target, a final image for targets that were not found, a combined
-`hybrid_scan_summary.jpg`, and every attempt and latency in `results.json`.
-
-For specific products, OCR ignores generic category words such as `soup` and
-`tuna` when a distinctive product or brand word remains. For example, an exact
-`StarKist` OCR match can verify the Qwen candidate even when OCR does not also
-read the word `tuna`.
