@@ -1,11 +1,21 @@
-# Python virtual environment
+# Python virtual environments
 .venv/
 venv/
 
-# Python cache
+# Python caches
 __pycache__/
-*.pyc
-*.pyo
+.pytest_cache/
+*.py[cod]
+
+# Downloaded object-detection models and text encoders
+hand_object_detection/yolov8*
+hand_object_detection/yoloe-*.pt
+hand_object_detection/mobileclip2_b.ts
+hand_object_detection/weights/
+hand_object_detection/yoloe_clip_video_test_output/
+hand_object_detection/video_test_output/
+hand_object_detection/gemini_video_test_output/
+hand_object_detection/qwen_video_test_output/
 
 # Test audio recordings
 *.wav
@@ -16,3 +26,11 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local test videos
+*.MOV
+*.mov
+*.mp4
+
+# Generated detection results
+hand_object_detection/*_test_output/
