@@ -9,7 +9,8 @@ import time
 import serial
 
 DEFAULT_BAUD = 9600
-MAP_FILE = "store_map.json"
+os.makedirs("maps", exist_ok=True)
+MAP_FILE = os.path.join("maps", f"store_map_{time.strftime('%Y%m%d_%H%M%S')}.json")
 STEP_THRESHOLD = 18000
 STEP_REFRACTORY = 0.3
 STEP_LENGTH = 0.7  
@@ -260,7 +261,6 @@ def main():
                 prev_prev_mag, prev_mag = prev_mag, mag
 
             if now - last_report >= 1.0:
-                # Keep rate line minimal so it doesn't clutter user typing
                 if bad > 0:
                     print(f"[rate] good={good}/s bad={bad}/s max_mag={max_mag:.0f}", flush=True)
                 good = bad = 0
@@ -269,14 +269,13 @@ def main():
 
     except KeyboardInterrupt:
         running = False
-        save()
         with data_lock:
             n_wps = len(map_data.get("waypoints", []))
-        print(f"\nDone. {step_count} steps and {n_wps} waypoints saved to {MAP_FILE}.")
-    except serial.SerialException as e:
-        running = False
-        save()
-        print(f"[-] Serial error (link dropped?): {e}")
+        if step_count > 0 or n_wps > 0:
+            save()
+            print(f"\nDone. {step_count} steps and {n_wps} waypoints saved to {MAP_FILE}.")
+        else:
+            print("\nNothing recorded, no file saved.")
 
 
 if __name__ == "__main__":
