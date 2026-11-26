@@ -65,7 +65,19 @@ if x_coords and y_coords:
       zorder=5,
       label="Current/End Position",
   )
-
+for wp in map_data.get("waypoints", []):
+    side = wp.get("side", "center")
+    tag = {"left": "L", "right": "R"}.get(side)
+    text = f"{wp['name']} ({tag})" if tag else wp["name"]
+    plt.scatter(wp["x"], wp["y"], color="black", s=25, zorder=6)
+    if side == "left":
+        offset, ha = (-8, 0), "right"
+    elif side == "right":
+        offset, ha = (8, 0), "left"
+    else:
+        offset, ha = (0, 8), "center"
+    plt.annotate(text, (wp["x"], wp["y"]), xytext=offset, textcoords="offset points",
+                 ha=ha, va="center", fontsize=10)
 plt.title("Assistive Store / Apartment SLAM Map", fontsize=14)
 plt.xlabel("X Coordinate (Aisle Width)", fontsize=12)
 plt.ylabel("Y Coordinate (Steps / Length)", fontsize=12)
