@@ -13,7 +13,7 @@ import re
 import tempfile
 import time
 import unicodedata
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -27,8 +27,17 @@ DEFAULT_MODEL = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
 GENERIC_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 
 
-class MacVisionTextVerifier:
-    """Verify a Qwen candidate by reading its source-resolution crop."""
+@dataclass(frozen=True)
+class OcrTextRegion:
+    """One recognized text line and its pixel box in the OCR input image."""
+
+    text: str
+    confidence: float
+    box: tuple[int, int, int, int] | None
+
+
+class PaddleTextVerifier:
+    """Verify a Qwen candidate with PP-OCRv5 Mobile on its source crop."""
 
     GENERIC_CONTAINER_WORDS = {
         "bottle",
@@ -48,19 +57,38 @@ class MacVisionTextVerifier:
         "water",
     }
 
-    def __init__(self, fuzzy_threshold: float, min_confidence: float) -> None:
+    def __init__(
+        self,
+        fuzzy_threshold: float,
+        min_confidence: float,
+        resize_width: int = 480,
+    ) -> None:
+        if resize_width <= 0:
+            raise ValueError("OCR resize width must be positive")
         try:
-            from Foundation import NSURL
-            import Vision
+            from paddleocr import PaddleOCR
         except ImportError as error:
             raise RuntimeError(
-                "OCR verification requires the macOS Vision framework through "
-                "PyObjC."
+                "OCR verification requires PaddleOCR and PaddlePaddle. Install "
+                "them with `python -m pip install paddlepaddle "
+                "\"paddleocr[all]\"`."
             ) from error
-        self._url_class = NSURL
-        self._vision = Vision
+        try:
+            self._ocr = PaddleOCR(
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+        except TypeError as error:
+            raise RuntimeError(
+                "OCR verification requires PaddleOCR 3.x. Upgrade it with "
+                "`python -m pip install --upgrade \"paddleocr[all]\"`."
+            ) from error
         self.fuzzy_threshold = fuzzy_threshold
         self.min_confidence = min_confidence
+        self.resize_width = resize_width
 
     @staticmethod
     def _tokens(value: str) -> list[str]:
@@ -114,8 +142,8 @@ class MacVisionTextVerifier:
         if crop.size == 0:
             raise RuntimeError("Qwen returned an empty OCR crop")
 
-        if crop.shape[1] < 700:
-            scale = min(3.0, 700.0 / crop.shape[1])
+        if crop.shape[1] < self.resize_width:
+            scale = min(3.0, self.resize_width / crop.shape[1])
             crop = cv2.resize(
                 crop,
                 None,
@@ -124,47 +152,51 @@ class MacVisionTextVerifier:
                 interpolation=cv2.INTER_CUBIC,
             )
 
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
-                temporary_path = Path(handle.name)
-            if not cv2.imwrite(str(temporary_path), crop):
-                raise RuntimeError("Could not create the temporary OCR crop")
-            request = self._vision.VNRecognizeTextRequest.alloc().initWithCompletionHandler_(
-                None
-            )
-            request.setRecognitionLevel_(
-                self._vision.VNRequestTextRecognitionLevelAccurate
-            )
-            request.setUsesLanguageCorrection_(True)
-            request.setRecognitionLanguages_(["en-US"])
-            handler = self._vision.VNImageRequestHandler.alloc().initWithURL_options_(
-                self._url_class.fileURLWithPath_(str(temporary_path)),
-                {},
-            )
-            succeeded, error = handler.performRequests_error_([request], None)
-            if not succeeded:
-                raise RuntimeError(f"macOS Vision OCR failed: {error}")
-            lines: list[str] = []
-            for observation in request.results() or []:
-                candidates = observation.topCandidates_(1)
-                if not candidates:
-                    continue
-                candidate = candidates[0]
-                if float(candidate.confidence()) >= self.min_confidence:
-                    lines.append(str(candidate.string()))
-            return " | ".join(lines)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        return " | ".join(region.text for region in self.recognize_regions(crop))
 
-    def verify(
-        self,
-        frame: np.ndarray,
-        detection: common.Detection,
-        target: str,
-    ) -> tuple[bool, str]:
-        text = self.recognize(frame, detection)
+    def recognize_regions(self, image: np.ndarray) -> list[OcrTextRegion]:
+        """Return filtered OCR text and boxes for an image in one inference."""
+        height, width = image.shape[:2]
+        regions: list[OcrTextRegion] = []
+        for prediction in self._ocr.predict(image):
+            payload = prediction if isinstance(prediction, dict) else prediction.json
+            if callable(payload):
+                payload = payload()
+            if not isinstance(payload, dict):
+                raise RuntimeError("PaddleOCR returned an unsupported result format")
+            result = payload.get("res", payload)
+            texts = result.get("rec_texts", [])
+            scores = result.get("rec_scores", [])
+            boxes = result.get("rec_boxes", [])
+            for index, text in enumerate(texts):
+                score = float(scores[index]) if index < len(scores) else 0.0
+                cleaned_text = str(text).strip()
+                if cleaned_text and score >= self.min_confidence:
+                    box: tuple[int, int, int, int] | None = None
+                    if index < len(boxes):
+                        raw_box = boxes[index]
+                        if hasattr(raw_box, "tolist"):
+                            raw_box = raw_box.tolist()
+                        if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
+                            left, top, right, bottom = (
+                                round(float(value)) for value in raw_box
+                            )
+                            left = max(0, min(width - 1, left))
+                            top = max(0, min(height - 1, top))
+                            right = max(left + 1, min(width, right))
+                            bottom = max(top + 1, min(height, bottom))
+                            box = (left, top, right, bottom)
+                    regions.append(
+                        OcrTextRegion(
+                            text=cleaned_text,
+                            confidence=score,
+                            box=box,
+                        )
+                    )
+        return regions
+
+    def text_matches(self, text: str, target: str) -> bool:
+        """Return whether OCR text contains the target's distinctive words."""
         observed_tokens = self._tokens(text)
         required_tokens = self._target_tokens(target)
         strong_match = bool(observed_tokens) and all(
@@ -195,8 +227,167 @@ class MacVisionTextVerifier:
             )
             for required_token in required_tokens
         )
-        matched = strong_match or (category_match and relaxed_distinctive_match)
-        return matched, text
+        return strong_match or (category_match and relaxed_distinctive_match)
+
+    def matching_region(
+        self,
+        regions: list[OcrTextRegion],
+        target: str,
+    ) -> tuple[bool, str, tuple[int, int, int, int] | None]:
+        """Match a target and return the tight union of its OCR text boxes."""
+        text = " | ".join(region.text for region in regions)
+        if not self.text_matches(text, target):
+            return False, text, None
+
+        required_tokens = self._target_tokens(target)
+        relaxed_threshold = max(0.60, self.fuzzy_threshold - 0.15)
+        candidates_by_token: list[list[OcrTextRegion]] = []
+        for required_token in required_tokens:
+            candidates = [
+                region
+                for region in regions
+                if region.box is not None
+                and any(
+                    self._word_matches(required_token, observed_token)
+                    or (
+                        len(observed_token) >= 4
+                        and self._word_similarity(required_token, observed_token)
+                        >= relaxed_threshold
+                    )
+                    for observed_token in self._tokens(region.text)
+                )
+            ]
+            if not candidates:
+                return True, text, None
+            candidates_by_token.append(candidates)
+
+        anchor_candidates = min(candidates_by_token, key=len)
+        anchor = max(anchor_candidates, key=lambda region: region.confidence)
+        assert anchor.box is not None
+        anchor_x = (anchor.box[0] + anchor.box[2]) / 2.0
+        anchor_y = (anchor.box[1] + anchor.box[3]) / 2.0
+
+        selected: list[OcrTextRegion] = []
+        for candidates in candidates_by_token:
+            selected.append(
+                min(
+                    candidates,
+                    key=lambda region: (
+                        (
+                            ((region.box[0] + region.box[2]) / 2.0 - anchor_x) ** 2
+                            + ((region.box[1] + region.box[3]) / 2.0 - anchor_y) ** 2
+                        )
+                        if region.box is not None
+                        else float("inf")
+                    ),
+                )
+            )
+        selected_boxes = [region.box for region in selected if region.box is not None]
+        if not selected_boxes:
+            return True, text, None
+        return (
+            True,
+            text,
+            (
+                min(box[0] for box in selected_boxes),
+                min(box[1] for box in selected_boxes),
+                max(box[2] for box in selected_boxes),
+                max(box[3] for box in selected_boxes),
+            ),
+        )
+
+    def verify(
+        self,
+        frame: np.ndarray,
+        detection: common.Detection,
+        target: str,
+    ) -> tuple[bool, str]:
+        text = self.recognize(frame, detection)
+        return self.text_matches(text, target), text
+
+
+class RapidTextVerifier(PaddleTextVerifier):
+    """Verify a Qwen candidate with RapidOCR's bundled ONNX models."""
+
+    def __init__(
+        self,
+        fuzzy_threshold: float,
+        min_confidence: float,
+        resize_width: int = 480,
+        recognition_model: str = "v6-small",
+    ) -> None:
+        if resize_width <= 0:
+            raise ValueError("OCR resize width must be positive")
+        try:
+            from rapidocr import RapidOCR
+            from rapidocr.utils.typings import LangRec, ModelType, OCRVersion
+        except ImportError as error:
+            raise RuntimeError(
+                "RapidOCR verification requires rapidocr and onnxruntime. "
+                "Install them with `python -m pip install rapidocr onnxruntime`."
+            ) from error
+        if recognition_model == "v6-small":
+            rapid_params = None
+        elif recognition_model == "v5-english-mobile":
+            rapid_params = {
+                "Rec.ocr_version": OCRVersion.PPOCRV5,
+                "Rec.model_type": ModelType.MOBILE,
+                "Rec.lang_type": LangRec.EN,
+            }
+        else:
+            raise ValueError(f"Unsupported RapidOCR recognition model: {recognition_model}")
+        self._rapid_ocr = RapidOCR(params=rapid_params)
+        self.fuzzy_threshold = fuzzy_threshold
+        self.min_confidence = min_confidence
+        self.resize_width = resize_width
+        self.recognition_model = recognition_model
+
+    def recognize(
+        self,
+        frame: np.ndarray,
+        detection: common.Detection,
+    ) -> str:
+        height, width = frame.shape[:2]
+        left, top, right, bottom = common.pixel_box(
+            detection.box_2d,
+            width,
+            height,
+        )
+        margin_x = max(8, round((right - left) * 0.08))
+        margin_y = max(8, round((bottom - top) * 0.08))
+        left = max(0, left - margin_x)
+        right = min(width, right + margin_x)
+        top = max(0, top - margin_y)
+        bottom = min(height, bottom + margin_y)
+        crop = frame[top:bottom, left:right]
+        if crop.size == 0:
+            raise RuntimeError("Qwen returned an empty OCR crop")
+
+        if crop.shape[1] < self.resize_width:
+            scale = min(3.0, self.resize_width / crop.shape[1])
+            crop = cv2.resize(
+                crop,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+        result = self._rapid_ocr(
+            crop,
+            use_cls=False,
+            text_score=self.min_confidence,
+        )
+        texts = result.txts or []
+        scores = result.scores or []
+        lines = [
+            str(text).strip()
+            for index, text in enumerate(texts)
+            if str(text).strip()
+            and (float(scores[index]) if index < len(scores) else 0.0)
+            >= self.min_confidence
+        ]
+        return " | ".join(lines)
 
 
 class LocalMlxQwenDetector:
@@ -223,6 +414,7 @@ class LocalMlxQwenDetector:
         self.dtype_name = "4-bit"
         self.upload_width = upload_width
         self.max_new_tokens = max_new_tokens
+        self.returns_pixel_coordinates = "qwen2.5-vl" in model_id.casefold()
         self._generate = generate
         self._apply_chat_template = apply_chat_template
 
@@ -246,30 +438,7 @@ class LocalMlxQwenDetector:
 
     @staticmethod
     def _build_prompt(target: str, target_type: str) -> str:
-        output_rules = (
-            "Return only JSON in this exact format: "
-            "{\"bbox_2d\":[x1,y1,x2,y2]}. Coordinates must be normalized "
-            "integers from 0 to 1000. Stop after the first valid match. If no valid "
-            "match is visible, return {\"bbox_2d\":[]}. Do not return a label, "
-            "confidence, markdown, or explanation."
-        )
-        if target_type == "generic":
-            return (
-                f"Locate the first clearly visible object belonging to the general "
-                f"category {target!r}. Any brand qualifies. Identify the category "
-                "from the object's appearance, shape, packaging, and scene context; "
-                "do not require matching brand text. Do not return a related product "
-                "from a different category. "
-                + output_rules
-            )
-        if target_type != "specific":
-            raise ValueError("target_type must be 'generic' or 'specific'")
-        return (
-            f"Locate the first visible product matching {target!r}. Verify the brand "
-            "and product using visible text, logo, and packaging; do not return a "
-            "similar product from another brand. "
-            + output_rules
-        )
+        return common.build_grounding_prompt(target, target_type)
 
     def detect(
         self,
@@ -312,6 +481,18 @@ class LocalMlxQwenDetector:
             image_width,
             image_height,
         )
+        if self.returns_pixel_coordinates:
+            detections = [
+                common.Detection(
+                    box_2d=(
+                        round(detection.box_2d[0] * 1000.0 / image_height),
+                        round(detection.box_2d[1] * 1000.0 / image_width),
+                        round(detection.box_2d[2] * 1000.0 / image_height),
+                        round(detection.box_2d[3] * 1000.0 / image_width),
+                    )
+                )
+                for detection in detections
+            ]
         usage = common.Usage(
             prompt_tokens=result.prompt_tokens,
             output_tokens=result.generation_tokens,
@@ -430,10 +611,10 @@ def main() -> int:
         f"Loaded with MLX Metal in {detector.load_seconds:.1f}s. "
         "Model will be reused for all samples.\n"
     )
-    ocr_verifier: MacVisionTextVerifier | None = None
+    ocr_verifier: PaddleTextVerifier | None = None
     if args.ocr_verify:
         try:
-            ocr_verifier = MacVisionTextVerifier(
+            ocr_verifier = PaddleTextVerifier(
                 fuzzy_threshold=args.ocr_fuzzy_threshold,
                 min_confidence=args.ocr_min_confidence,
             )
@@ -571,7 +752,7 @@ def main() -> int:
         "sample_every_seconds": args.sample_every_seconds,
         "ocr_verification": {
             "enabled": args.ocr_verify,
-            "engine": "macOS Vision" if args.ocr_verify else None,
+            "engine": "PaddleOCR PP-OCRv5 Mobile" if args.ocr_verify else None,
             "fuzzy_threshold": args.ocr_fuzzy_threshold,
             "min_confidence": args.ocr_min_confidence,
             "rejected_candidates": sum(

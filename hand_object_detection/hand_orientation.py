@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import platform
 import shutil
 import subprocess
 import time
@@ -51,8 +52,14 @@ DEFAULT_OBJECT_NMS_THRESHOLD = 0.45
 DEFAULT_OBJECT_INPUT_SIZE = 320
 DEFAULT_OBJECT_DETECTION_INTERVAL = 3
 DEFAULT_GUIDANCE_RADIUS_FRACTION = 0.075
-DEFAULT_QWEN_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
-DEFAULT_QWEN_UPLOAD_WIDTH = 960
+DEFAULT_QWEN_BACKEND = "auto"
+DEFAULT_QWEN_MODEL = None
+DEFAULT_QWEN_MLX_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+DEFAULT_QWEN_TRANSFORMERS_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
+DEFAULT_QWEN_DEVICE = "auto"
+DEFAULT_QWEN_DTYPE = "auto"
+DEFAULT_QWEN_QUANTIZATION = "auto"
+DEFAULT_QWEN_UPLOAD_WIDTH = 864
 DEFAULT_QWEN_MAX_NEW_TOKENS = 64
 DEFAULT_SIGLIP_MODEL = "google/siglip2-base-patch16-224"
 DEFAULT_OCR_FUZZY_THRESHOLD = 0.74
@@ -72,6 +79,33 @@ LOGITECH_FRAME_WIDTH = 1280
 LOGITECH_FRAME_HEIGHT = 720
 LOGITECH_FRAME_RATE = 30
 STATUS_PANEL_HEIGHT = 250
+
+
+def resolve_qwen_backend(backend: str) -> str:
+    """Resolve the portable Qwen backend for the current computer."""
+    if backend not in ("auto", "mlx", "transformers"):
+        raise ValueError("Qwen backend must be auto, mlx, or transformers")
+    apple_silicon = (
+        platform.system() == "Darwin"
+        and platform.machine().casefold() in ("arm64", "aarch64")
+    )
+    if backend == "auto":
+        return "mlx" if apple_silicon else "transformers"
+    if backend == "mlx" and not apple_silicon:
+        raise RuntimeError(
+            "The MLX Qwen backend requires Apple Silicon. Use the Transformers "
+            "backend on Windows or Linux."
+        )
+    return backend
+
+
+def default_qwen_model(backend: str) -> str:
+    """Return the checkpoint compatible with one resolved Qwen backend."""
+    if backend == "mlx":
+        return DEFAULT_QWEN_MLX_MODEL
+    if backend == "transformers":
+        return DEFAULT_QWEN_TRANSFORMERS_MODEL
+    raise ValueError(f"Unsupported resolved Qwen backend: {backend}")
 
 WRIST = 0
 INDEX_MCP = 5
@@ -288,7 +322,7 @@ class QwenSiglipObjectDetector:
     def __init__(
         self,
         target_name: str,
-        model_id: str,
+        model_id: str | None,
         upload_width: int,
         max_new_tokens: int,
         siglip_model_id: str,
@@ -296,32 +330,66 @@ class QwenSiglipObjectDetector:
         ocr_verify: bool = False,
         ocr_fuzzy_threshold: float = DEFAULT_OCR_FUZZY_THRESHOLD,
         ocr_min_confidence: float = DEFAULT_OCR_MIN_CONFIDENCE,
+        backend: str = DEFAULT_QWEN_BACKEND,
+        device: str = DEFAULT_QWEN_DEVICE,
+        dtype_name: str = DEFAULT_QWEN_DTYPE,
+        quantization: str = DEFAULT_QWEN_QUANTIZATION,
     ) -> None:
         try:
             from qwen_mlx_batch_check import SiglipCropVerifier
-            from qwen_mlx_video_check import (
-                LocalMlxQwenDetector,
-                MacVisionTextVerifier,
-            )
-            from qwen_video_check import pixel_box
+            from qwen_mlx_video_check import PaddleTextVerifier
+            from qwen_video_check import LocalQwenDetector, pixel_box
         except ImportError as error:
             raise RuntimeError(
-                "Qwen + SigLIP guidance requires mlx-vlm, torch, transformers, "
-                "and Pillow. See the README setup instructions."
+                "Qwen + SigLIP guidance requires torch, transformers, and Pillow. "
+                "The MLX backend additionally requires mlx-vlm. See the README "
+                "setup instructions."
             ) from error
 
+        resolved_backend = resolve_qwen_backend(backend)
+        resolved_model_id = model_id or default_qwen_model(resolved_backend)
         self.target_name = target_name
+        self.backend = resolved_backend
+        self.model_id = resolved_model_id
         self._pixel_box = pixel_box
         self.ocr_enabled = ocr_verify
         self.last_ocr_match: bool | None = None
         self.last_ocr_text: str | None = None
-        print(f"Loading local Qwen detector: {model_id}")
-        self._qwen = LocalMlxQwenDetector(
-            model_id=model_id,
-            upload_width=upload_width,
-            max_new_tokens=max_new_tokens,
+        print(
+            f"Loading local Qwen detector ({resolved_backend}): "
+            f"{resolved_model_id}"
         )
-        print(f"Qwen loaded in {self._qwen.load_seconds:.2f}s.")
+        if resolved_backend == "mlx":
+            try:
+                from qwen_mlx_video_check import LocalMlxQwenDetector
+            except ImportError as error:
+                raise RuntimeError(
+                    "The Apple MLX backend requires mlx-vlm. Install it with "
+                    "`python -m pip install --upgrade mlx-vlm`."
+                ) from error
+            self._qwen = LocalMlxQwenDetector(
+                model_id=resolved_model_id,
+                upload_width=upload_width,
+                max_new_tokens=max_new_tokens,
+            )
+            runtime_description = "MLX Metal"
+        else:
+            self._qwen = LocalQwenDetector(
+                model_id=resolved_model_id,
+                device=device,
+                dtype_name=dtype_name,
+                upload_width=upload_width,
+                max_new_tokens=max_new_tokens,
+                quantization=quantization,
+            )
+            runtime_description = (
+                f"PyTorch {self._qwen.device}, {self._qwen.dtype_name}, "
+                f"{self._qwen.quantization}"
+            )
+        print(
+            f"Qwen loaded with {runtime_description} in "
+            f"{self._qwen.load_seconds:.2f}s."
+        )
         print(f"Loading SigLIP verifier: {siglip_model_id}")
         self._siglip = SiglipCropVerifier(
             model_id=siglip_model_id,
@@ -333,18 +401,18 @@ class QwenSiglipObjectDetector:
         )
         self._ocr = None
         if ocr_verify:
-            self._ocr = MacVisionTextVerifier(
+            self._ocr = PaddleTextVerifier(
                 fuzzy_threshold=ocr_fuzzy_threshold,
                 min_confidence=ocr_min_confidence,
             )
             print(
-                "Apple Vision OCR verification enabled "
+                "PaddleOCR verification enabled "
                 f"(fuzzy threshold {ocr_fuzzy_threshold:.2f}, "
                 f"minimum confidence {ocr_min_confidence:.2f})."
             )
 
     def detect(self, frame: np.ndarray) -> ObjectDetection | None:
-        """Return the first box accepted by SigLIP and optional Vision OCR."""
+        """Return the first box accepted by SigLIP and optional PaddleOCR."""
         self.last_ocr_match = None
         self.last_ocr_text = None
         detections, _, _, _, _ = self._qwen.detect(
@@ -373,7 +441,7 @@ class QwenSiglipObjectDetector:
             )
             readable_text = self.last_ocr_text or "<no text read>"
             decision = "accepted" if self.last_ocr_match else "rejected"
-            print(f"Apple Vision OCR {decision}: {readable_text}")
+            print(f"PaddleOCR {decision}: {readable_text}")
             if not self.last_ocr_match:
                 return None
 
@@ -412,9 +480,14 @@ class RemoteObjectDetector:
         self.upload_width = upload_width
         self.jpeg_quality = jpeg_quality
         self.timeout_seconds = timeout_seconds
+        self.last_server_latency_seconds: float | None = None
+        self.last_round_trip_seconds: float | None = None
 
     def detect(self, frame: np.ndarray) -> ObjectDetection | None:
         """Upload one frame and convert the returned normalized box to pixels."""
+        round_trip_started = time.perf_counter()
+        self.last_server_latency_seconds = None
+        self.last_round_trip_seconds = None
         frame_height, frame_width = frame.shape[:2]
         if frame_width > self.upload_width:
             upload_height = max(
@@ -464,6 +537,13 @@ class RemoteObjectDetector:
                 f"Could not reach computer detector at {self.endpoint}: "
                 f"{error.reason}"
             ) from error
+
+        self.last_round_trip_seconds = time.perf_counter() - round_trip_started
+        reported_latency = payload.get("latency_seconds")
+        if isinstance(reported_latency, (int, float)):
+            reported_latency = float(reported_latency)
+            if math.isfinite(reported_latency) and reported_latency >= 0.0:
+                self.last_server_latency_seconds = reported_latency
 
         status = payload.get("status")
         if status == "not_detected":
@@ -1055,7 +1135,7 @@ def parse_args() -> argparse.Namespace:
         choices=("qwen-siglip", "remote", "yoloe"),
         default="qwen-siglip",
         help=(
-            "Object detector: local Qwen 4B plus SigLIP on Apple Silicon "
+            "Object detector: local Qwen 4B plus SigLIP on macOS/Windows "
             "(default), remote computer detection, or YOLOE-26"
         ),
     )
@@ -1102,15 +1182,42 @@ def parse_args() -> argparse.Namespace:
         help="Run object detection every N camera frames (default: 3)",
     )
     parser.add_argument(
+        "--qwen-backend",
+        choices=("auto", "mlx", "transformers"),
+        default=DEFAULT_QWEN_BACKEND,
+        help=(
+            "Qwen runtime: auto selects MLX on Apple Silicon and Transformers "
+            "elsewhere (default: auto)"
+        ),
+    )
+    parser.add_argument(
         "--qwen-model",
         default=DEFAULT_QWEN_MODEL,
-        help="MLX Qwen checkpoint used by qwen-siglip",
+        help="Override the backend-specific Qwen checkpoint",
+    )
+    parser.add_argument(
+        "--qwen-device",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default=DEFAULT_QWEN_DEVICE,
+        help="PyTorch Qwen device used by the Transformers backend",
+    )
+    parser.add_argument(
+        "--qwen-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default=DEFAULT_QWEN_DTYPE,
+        help="PyTorch Qwen dtype used by the Transformers backend",
+    )
+    parser.add_argument(
+        "--qwen-quantization",
+        choices=("auto", "4bit", "none"),
+        default=DEFAULT_QWEN_QUANTIZATION,
+        help="Use bitsandbytes 4-bit Qwen weights on CUDA (default: auto)",
     )
     parser.add_argument(
         "--qwen-upload-width",
         type=int,
         default=DEFAULT_QWEN_UPLOAD_WIDTH,
-        help="Image width sent to Qwen (default: 960)",
+        help="Image width sent to Qwen (default: 864)",
     )
     parser.add_argument(
         "--qwen-max-new-tokens",
@@ -1132,7 +1239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ocr-verify",
         action="store_true",
-        help="Verify a branded product using Apple Vision OCR (macOS only)",
+        help="Verify a branded product using PaddleOCR",
     )
     parser.add_argument(
         "--ocr-fuzzy-threshold",
@@ -1144,7 +1251,7 @@ def parse_args() -> argparse.Namespace:
         "--ocr-min-confidence",
         type=float,
         default=DEFAULT_OCR_MIN_CONFIDENCE,
-        help="Minimum Apple Vision text confidence (default: 0.25)",
+        help="Minimum PaddleOCR text confidence (default: 0.25)",
     )
     parser.add_argument(
         "--remote-url",
@@ -1320,8 +1427,8 @@ def main() -> None:
 
     if args.object_detector == "qwen-siglip" and args.computer == "pi":
         raise SystemExit(
-            "Qwen + SigLIP uses Apple MLX and cannot run on Raspberry Pi. "
-            "Use --object-detector remote to call the computer, or use YOLOE."
+            "Local Qwen + SigLIP is not supported on this Raspberry Pi. Use "
+            "--object-detector remote to call the computer, or use YOLOE."
         )
 
     try:
@@ -1336,6 +1443,10 @@ def main() -> None:
                 ocr_verify=args.ocr_verify,
                 ocr_fuzzy_threshold=args.ocr_fuzzy_threshold,
                 ocr_min_confidence=args.ocr_min_confidence,
+                backend=args.qwen_backend,
+                device=args.qwen_device,
+                dtype_name=args.qwen_dtype,
+                quantization=args.qwen_quantization,
             )
         elif args.object_detector == "remote":
             object_detector = RemoteObjectDetector(
@@ -1452,6 +1563,10 @@ def main() -> None:
         thread_name_prefix="object-detection",
     )
     object_future: Future[ObjectDetection | None] | None = None
+    object_detection_started_at: float | None = None
+    last_detection_latency_seconds: float | None = None
+    last_server_latency_seconds: float | None = None
+    last_round_trip_seconds: float | None = None
     preview_executor: ThreadPoolExecutor | None = None
     preview_future: Future[None] | None = None
     last_preview_error: str | None = None
@@ -1485,8 +1600,15 @@ def main() -> None:
                     time.sleep(CAMERA_RETRY_DELAY_SECONDS)
                     continue
 
+                # End-to-end detection timing begins when the Pi receives the
+                # camera frame that will later be submitted for detection.
+                frame_received_at = time.perf_counter()
                 consecutive_camera_failures = 0
                 height, width = camera_frame.shape[:2]
+                alignment_radius_pixels = max(
+                    1,
+                    int(round(args.guidance_radius * min(width, height))),
+                )
 
                 # Inference always uses the raw image so XYZ remains in the physical
                 # camera frame even when the preview is mirrored for the user.
@@ -1518,6 +1640,7 @@ def main() -> None:
                 object_detection_ran = False
                 if object_future is not None and object_future.done():
                     object_detection_ran = True
+                    completed_request_started_at = object_detection_started_at
                     try:
                         current_object_detection = object_future.result()
                         object_detector_error = None
@@ -1525,10 +1648,90 @@ def main() -> None:
                         if current_object_detection is not None:
                             object_detection = current_object_detection
                             object_search_enabled = False
+                            left, top, box_width, box_height = (
+                                current_object_detection.box
+                            )
+                            calculated_target_center = (
+                                left + box_width // 2,
+                                top + box_height // 2,
+                            )
+                            if completed_request_started_at is not None:
+                                # End timing as soon as the Pi has calculated
+                                # the target circle. Debug drawing, preview
+                                # transfer, and speech are deliberately excluded.
+                                last_detection_latency_seconds = (
+                                    time.perf_counter()
+                                    - completed_request_started_at
+                                )
+                                timing_breakdown: list[str] = []
+                                reported_model_seconds = getattr(
+                                    object_detector,
+                                    "last_server_latency_seconds",
+                                    None,
+                                )
+                                reported_round_trip_seconds = getattr(
+                                    object_detector,
+                                    "last_round_trip_seconds",
+                                    None,
+                                )
+                                if reported_model_seconds is not None:
+                                    timing_breakdown.append(
+                                        f"Mac model {reported_model_seconds:.2f}s"
+                                    )
+                                if reported_round_trip_seconds is not None:
+                                    timing_breakdown.append(
+                                        "Pi-Mac round trip "
+                                        f"{reported_round_trip_seconds:.2f}s"
+                                    )
+                                breakdown_suffix = (
+                                    f" ({', '.join(timing_breakdown)})"
+                                    if timing_breakdown
+                                    else ""
+                                )
+                                print(
+                                    "Detection latency "
+                                    "(Pi camera frame to calculated target radius): "
+                                    f"{last_detection_latency_seconds:.2f}s; "
+                                    f"center={calculated_target_center}, "
+                                    f"radius={alignment_radius_pixels}px"
+                                    f"{breakdown_suffix}"
+                                )
+                        elif completed_request_started_at is not None:
+                            no_detection_seconds = (
+                                time.perf_counter()
+                                - completed_request_started_at
+                            )
+                            print(
+                                "No-detection response latency "
+                                "(Pi camera frame to result): "
+                                f"{no_detection_seconds:.2f}s"
+                            )
                     except Exception as error:
                         object_visible = False
                         object_detector_error = str(error)
                         print(f"Object detection failed: {error}")
+                        if completed_request_started_at is not None:
+                            failed_seconds = (
+                                time.perf_counter()
+                                - completed_request_started_at
+                            )
+                            print(
+                                "Failed detection request latency "
+                                "(Pi camera frame to error): "
+                                f"{failed_seconds:.2f}s"
+                            )
+                    finally:
+                        object_detection_started_at = None
+                        last_server_latency_seconds = getattr(
+                            object_detector,
+                            "last_server_latency_seconds",
+                            None,
+                        )
+                        last_round_trip_seconds = getattr(
+                            object_detector,
+                            "last_round_trip_seconds",
+                            None,
+                        )
                     object_future = None
 
                 may_search_current_frame = (
@@ -1543,6 +1746,7 @@ def main() -> None:
                         or frame_number % args.object_every == 0
                     )
                 ):
+                    object_detection_started_at = frame_received_at
                     object_future = object_executor.submit(
                         object_detector.detect,
                         camera_frame.copy(),
@@ -1737,10 +1941,6 @@ def main() -> None:
                     0.62,
                 )
 
-                alignment_radius_pixels = max(
-                    1,
-                    int(round(args.guidance_radius * min(width, height))),
-                )
                 guidance = ""
                 aligned = False
                 if palm_camera_center is not None and object_camera_center is not None:
@@ -1818,9 +2018,24 @@ def main() -> None:
                         0.58,
                     )
 
+                if last_detection_latency_seconds is not None:
+                    latency_status = (
+                        "DETECTION LATENCY (PI FRAME -> RADIUS CALCULATED): "
+                        f"{last_detection_latency_seconds:.2f} s"
+                    )
+                elif object_future is not None:
+                    latency_status = (
+                        "DETECTION LATENCY "
+                        "(PI FRAME -> RADIUS CALCULATED): measuring..."
+                    )
+                else:
+                    latency_status = (
+                        "DETECTION LATENCY "
+                        "(PI FRAME -> RADIUS CALCULATED): waiting"
+                    )
                 _draw_text(
                     display_frame,
-                    "Axes: +X left, +Y up, +Z forward; origin at camera lens",
+                    latency_status,
                     status_y + 204,
                     (210, 210, 210),
                     0.54,
@@ -1829,9 +2044,9 @@ def main() -> None:
                 cv2.putText(
                     display_frame,
                     (
-                        "Approximate monocular XYZ - press Q or Esc to quit"
+                        "Axes: +X left, +Y up, +Z forward - press Q or Esc to quit"
                         if not args.no_local_display
-                        else "Approximate monocular XYZ - Ctrl-C to quit"
+                        else "Axes: +X left, +Y up, +Z forward - Ctrl-C to quit"
                     ),
                     (18, status_y + 236),
                     cv2.FONT_HERSHEY_SIMPLEX,

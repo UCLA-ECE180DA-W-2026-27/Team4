@@ -70,15 +70,22 @@ conda create --name tetris python=3.11 -y
 conda activate tetris
 ```
 
-Install the required packages:
+Install the common packages:
 
 ```bash
 python -m pip install opencv-python mediapipe numpy ultralytics
+python -m pip install paddlepaddle "paddleocr[all]"
+```
+
+On an Apple Silicon Mac, install the MLX Qwen and SigLIP dependencies:
+
+```bash
 python -m pip install --upgrade mlx-vlm torch torchvision transformers pillow
 ```
 
-Run the bridged Qwen 4B + SigLIP detector and hand guidance on an Apple Silicon
-Mac. The first run downloads both models; later runs use the local cache:
+Run the bridged Qwen 4B + SigLIP detector and hand guidance. Qwen automatically
+uses the Apple MLX backend. The first run downloads both models; later runs use
+the local cache:
 
 ```bash
 cd hand_object_detection
@@ -97,9 +104,42 @@ reaches; object detection is re-armed only after the tracked hand disappears.
 Use `--camera 1`, `--camera 2`, and so on to select another camera. Object
 names containing spaces must be enclosed in quotes.
 
-The Qwen backend uses Apple MLX and cannot run on Raspberry Pi. To run the
-guidance loop on a Pi after installing compatible MediaPipe and Ultralytics
-dependencies, select the retained YOLOE fallback:
+### Windows Qwen setup
+
+The Windows path uses the official `Qwen/Qwen3-VL-4B-Instruct` checkpoint with
+PyTorch/Transformers. An NVIDIA GPU is strongly recommended. Install the
+CUDA-enabled PyTorch build selected for the computer at
+<https://pytorch.org/get-started/locally/>, then install the remaining packages
+from PowerShell:
+
+```powershell
+cd hand_object_detection
+python -m pip install -r requirements-windows.txt
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+```
+
+Run object detection locally with the Windows camera:
+
+```powershell
+python hand_orientation.py --laptop --camera-facing away --object "soup can" --speak-guidance
+```
+
+Or run only the computer detector for the split Pi/computer architecture:
+
+```powershell
+python object_detection_server.py --host WINDOWS_USB_IP --object "cereal"
+```
+
+On Windows, `--qwen-backend auto` selects Transformers, `--qwen-device auto`
+selects CUDA when available, and `--qwen-quantization auto` loads Qwen in 4-bit
+mode through bitsandbytes. A CPU fallback is available with
+`--qwen-device cpu --qwen-quantization none`, but it is unlikely to meet the
+interactive latency target.
+
+Local Qwen is intentionally run on the Mac or Windows computer, not the
+Raspberry Pi. To run object detection directly on the Pi after installing
+compatible MediaPipe and Ultralytics dependencies, select the retained YOLOE
+fallback:
 
 ```bash
 cd ~/180DATeam4/hand_object_detection
@@ -116,7 +156,7 @@ python hand_orientation.py \
 For the intended two-device architecture, connect the Logitech camera to the
 Pi. The Pi keeps each frame for MediaPipe hand tracking and sends a 960-pixel
 JPEG copy over the private USB-network link. The computer runs Qwen + SigLIP
-and optionally verifies branded-product text with Apple Vision OCR before
+and optionally verifies branded-product text with PaddleOCR before
 returning a normalized bounding box. The Pi caches that box for guidance and
 requests another detection only after the hand disappears.
 
@@ -131,7 +171,7 @@ python object_detection_server.py \
   --object "cereal"
 ```
 
-For an exact branded product, require the existing macOS Vision OCR verifier:
+For an exact branded product, require the PaddleOCR verifier:
 
 ```bash
 python object_detection_server.py \
@@ -142,8 +182,9 @@ python object_detection_server.py \
 
 OCR is intentionally optional: use it for targets with distinctive visible
 brand or product text, but leave it off for generic targets such as `cereal`
-or `reusable bottle`. If the Vision Python bridge is missing, install it in the
-Mac environment with `python -m pip install pyobjc-framework-Vision`.
+or `reusable bottle`. PaddleOCR uses the lightweight PP-OCRv5 Mobile detection
+model and English recognition model. The first OCR-enabled run downloads the
+models; later runs reuse the local cache.
 
 Then start hand guidance on the Pi with the same object name:
 
@@ -164,9 +205,14 @@ python hand_orientation.py \
 
 Replace `10.12.194.2` if the computer has a different address on the USB
 interface. The computer opens a live debug window showing the Pi's annotated
-camera feed, hand landmarks, returned object box, and current guidance. Press
-`q` in that window to stop the computer server; stop the Pi process with
-Ctrl-C. Use `--no-preview` on the computer only when no debug window is needed.
+camera feed, hand landmarks, returned object box, current guidance, and
+end-to-end detection latency. Timing begins when the Pi reads the camera frame
+selected for detection and ends when the returned box has been converted into
+the target center and radius. Debug drawing, preview upload, and speech are not
+included. The terminal also reports Mac model and Pi-to-Mac round-trip timing
+as a breakdown. Press `q` in that window to stop the computer server; stop the
+Pi process with Ctrl-C. Use `--no-preview` on the computer only when no debug
+window is needed.
 
 To start both processes from one Mac command instead, run:
 
@@ -175,7 +221,7 @@ cd /Users/jiali/180DATeam4/hand_object_detection
 bash start_pi_hand_guidance.sh "cereal"
 ```
 
-Enable Apple Vision OCR from the combined launcher for a branded product:
+Enable PaddleOCR from the combined launcher for a branded product:
 
 ```bash
 bash start_pi_hand_guidance.sh "Campbell's soup" --ocr
@@ -195,10 +241,10 @@ conda deactivate
 ## Local Qwen video object-detection benchmark
 
 `hand_object_detection/qwen_video_check.py` runs the official
-`Qwen/Qwen3-VL-2B-Instruct` model locally. Frames and prompts remain on the Mac;
-only the initial model download requires internet access. The model is loaded
-once and reused across samples, and loading time is reported separately from
-per-frame inference.
+`Qwen/Qwen3-VL-2B-Instruct` model locally through PyTorch/Transformers. Frames
+and prompts remain on the computer; only the initial model download requires
+internet access. The model is loaded once and reused across samples, and
+loading time is reported separately from per-frame inference.
 
 Install the local inference dependencies in the Conda environment:
 
@@ -219,9 +265,10 @@ python qwen_video_check.py \
 ```
 
 The first run downloads several gigabytes of weights. Later runs reuse the
-local Hugging Face cache. On Apple Silicon, the script uses Metal automatically
-and retains the model between frames. It writes annotated frames, a review MP4,
-and `results.json` under `hand_object_detection/qwen_video_test_output/`.
+local Hugging Face cache. The script automatically selects CUDA on Windows,
+Metal on Apple Silicon, or CPU as a slower fallback. Windows CUDA uses 4-bit
+bitsandbytes by default. It writes annotated frames, a review MP4, and
+`results.json` under `hand_object_detection/qwen_video_test_output/`.
 
 ### Four-bit MLX benchmark on Apple Silicon
 
@@ -292,6 +339,23 @@ downloads `google/siglip2-base-patch16-224`; later runs reuse the local cache.
 Qwen time, SigLIP time, category scores, and the final accept/reject decision
 are saved in `results.json`.
 
+Test several branded products on the same frame with one Qwen and PaddleOCR
+model load:
+
+```bash
+python qwen_mlx_batch_check.py \
+  --video ../test1.mp4 \
+  --objects "Campbell's soup" "StarKist tuna" "Raisin Bran" \
+  --time-seconds 26 \
+  --upload-width 960 \
+  --ocr-verify \
+  --output-dir qwen_video_test_output/test1_branded_paddleocr
+```
+
+This treats every target as a specific product, saves an annotated image for
+each brand, and records the recognized text, OCR match, and OCR latency in
+`results.json`.
+
 Measure accuracy across the 12 labeled stationary-frame cases in `test1.mp4`:
 
 ```bash
@@ -306,8 +370,8 @@ to evaluate another labeled video without editing the script.
 
 OCR verification is disabled by default, which is appropriate for generic
 objects that may not contain useful text. For faster 960-pixel Qwen proposals
-with offline text verification, add `--ocr-verify`. The verifier uses macOS
-Vision OCR on the corresponding crop
+with offline text verification, add `--ocr-verify`. The verifier uses PaddleOCR
+PP-OCRv5 Mobile on the corresponding crop
 from the original full-resolution frame, then accepts the box only when every
 distinctive target word matches. Rejected candidates are drawn in orange in
 the review video.
@@ -325,4 +389,4 @@ python qwen_mlx_video_check.py \
 ```
 
 OCR text, match decisions, OCR latency, Qwen candidate boxes, and accepted
-boxes are recorded in `results.json`. This OCR mode is macOS-only.
+boxes are recorded in `results.json`.
