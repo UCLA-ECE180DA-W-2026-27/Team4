@@ -21,8 +21,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import shutil
-import subprocess
+import platform
+import queue
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -38,6 +39,17 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
+# MLX-VLM creates disabled tqdm progress bars during inference. tqdm's default
+# lock is a multiprocessing RLock, which allocates an unnecessary named
+# semaphore and can race with Python's resource tracker during shutdown. This
+# application coordinates progress only between threads, so use a thread lock.
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+else:
+    _tqdm.set_lock(threading.RLock())
+
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().with_name("hand_landmarker.task")
 DEFAULT_OBJECT_MODEL_PATH = Path(__file__).resolve().with_name(
@@ -51,9 +63,16 @@ DEFAULT_OBJECT_NMS_THRESHOLD = 0.45
 DEFAULT_OBJECT_INPUT_SIZE = 320
 DEFAULT_OBJECT_DETECTION_INTERVAL = 3
 DEFAULT_GUIDANCE_RADIUS_FRACTION = 0.075
-DEFAULT_QWEN_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
-DEFAULT_QWEN_UPLOAD_WIDTH = 960
+DEFAULT_QWEN_BACKEND = "auto"
+DEFAULT_QWEN_MODEL = None
+DEFAULT_QWEN_MLX_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+DEFAULT_QWEN_TRANSFORMERS_MODEL = "Qwen/Qwen3-VL-4B-Instruct"
+DEFAULT_QWEN_DEVICE = "auto"
+DEFAULT_QWEN_DTYPE = "auto"
+DEFAULT_QWEN_QUANTIZATION = "auto"
+DEFAULT_QWEN_UPLOAD_WIDTH = 864
 DEFAULT_QWEN_MAX_NEW_TOKENS = 64
+DEFAULT_QWEN_SLOW_SECONDS = 2.0
 DEFAULT_SIGLIP_MODEL = "google/siglip2-base-patch16-224"
 DEFAULT_OCR_FUZZY_THRESHOLD = 0.74
 DEFAULT_OCR_MIN_CONFIDENCE = 0.25
@@ -64,6 +83,9 @@ DEFAULT_REMOTE_PREVIEW_WIDTH = 960
 DEFAULT_REMOTE_PREVIEW_JPEG_QUALITY = 70
 DEFAULT_REMOTE_PREVIEW_INTERVAL = 3
 SPEECH_CHANGE_BUFFER_SECONDS = 1.8
+HAND_NOT_DETECTED_DELAY_SECONDS = 3.0
+HAND_NOT_DETECTED_REPEAT_SECONDS = 5.0
+OBJECT_MISSING_CONFIRMATION_ATTEMPTS = 2
 MAX_CAMERA_READ_FAILURES = 30
 CAMERA_RETRY_DELAY_SECONDS = 0.1
 LAPTOP_LOGITECH_CAMERA_INDEX = 0
@@ -72,6 +94,34 @@ LOGITECH_FRAME_WIDTH = 1280
 LOGITECH_FRAME_HEIGHT = 720
 LOGITECH_FRAME_RATE = 30
 STATUS_PANEL_HEIGHT = 250
+
+
+def resolve_qwen_backend(backend: str) -> str:
+    """Resolve the portable Qwen backend for the current computer."""
+    if backend not in ("auto", "mlx", "transformers"):
+        raise ValueError("Qwen backend must be auto, mlx, or transformers")
+    apple_silicon = (
+        platform.system() == "Darwin"
+        and platform.machine().casefold() in ("arm64", "aarch64")
+    )
+    if backend == "auto":
+        return "mlx" if apple_silicon else "transformers"
+    if backend == "mlx" and not apple_silicon:
+        raise RuntimeError(
+            "The MLX Qwen backend requires Apple Silicon. Use the Transformers "
+            "backend on Windows or Linux."
+        )
+    return backend
+
+
+def default_qwen_model(backend: str) -> str:
+    """Return the checkpoint compatible with one resolved Qwen backend."""
+    if backend == "mlx":
+        return DEFAULT_QWEN_MLX_MODEL
+    if backend == "transformers":
+        return DEFAULT_QWEN_TRANSFORMERS_MODEL
+    raise ValueError(f"Unsupported resolved Qwen backend: {backend}")
+
 
 WRIST = 0
 INDEX_MCP = 5
@@ -128,54 +178,414 @@ class ObjectDetection:
 
 
 class GuidanceSpeaker:
-    """Repeat actionable guidance asynchronously with the system TTS voice."""
+    """Repeat actionable guidance asynchronously with one pyttsx3 engine."""
 
-    def __init__(self, computer: str) -> None:
-        if computer == "laptop":
-            speech_program = shutil.which("say")
-            if speech_program is None:
-                raise RuntimeError("Spoken guidance requires the macOS 'say' command.")
-            self._command_prefix = [speech_program, "-r", "150"]
-        else:
-            speech_program = shutil.which("espeak-ng") or shutil.which("espeak")
-            if speech_program is None:
-                raise RuntimeError(
-                    "Spoken guidance requires eSpeak. Install it with "
-                    "'sudo apt install espeak-ng'."
-                )
-            self._command_prefix = [speech_program, "-s", "150"]
+    def __init__(self, debug: bool = False) -> None:
+        try:
+            import pyttsx3
+        except ImportError as error:
+            raise RuntimeError(
+                "Spoken guidance requires pyttsx3. Install it with "
+                "`python -m pip install pyttsx3`."
+            ) from error
 
+        self._pyttsx3 = pyttsx3
+        self._speech_rate = 50
+        self._engine_rate: float | int = self._speech_rate
+        self._debug = debug
+        self._messages: queue.Queue[
+            tuple[int, str, bool] | None
+        ] = queue.Queue(maxsize=1)
+        self._closed = False
+        self._engine = None
+        self._cached_sounds: dict[str, object] = {}
+        self._engine_error: Exception | None = None
+        self._engine_ready = threading.Event()
+        self._state_lock = threading.Lock()
+        self._next_request_id = 0
+        self._outstanding_request_ids: set[int] = set()
+        self._current_request_id: int | None = None
+        self._current_message: str | None = None
+        self._priority_speech_active = threading.Event()
+        self._priority_request_id: int | None = None
+        self._priority_message: str | None = None
+        self._last_debug_suppression: tuple[str, str] | None = None
         self._last_message: str | None = None
         self._last_announcement_at: float | None = None
-        self._process: subprocess.Popen | None = None
+        self._last_hand_not_detected_at: float | None = None
         self._object_detection_announced = False
         self._object_reannouncement_armed = False
+        self._object_announcement_pending = False
+        self._object_not_detected_announced = False
+        self._object_not_detected_pending = False
         self._hand_was_visible = False
+        self._worker = threading.Thread(
+            target=self._speech_worker,
+            name="guidance-speech",
+            daemon=True,
+        )
+        self._worker.start()
 
-    def _stop_current_message(self) -> None:
-        """Stop obsolete speech so the latest instruction can play promptly."""
-        process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-        self._process = None
+        if not self._engine_ready.wait(timeout=10.0):
+            self._closed = True
+            raise RuntimeError("Timed out while initializing pyttsx3")
+        if self._engine_error is not None:
+            self._closed = True
+            raise RuntimeError(
+                "Could not initialize pyttsx3 with the system speech backend: "
+                f"{self._engine_error}"
+            ) from self._engine_error
 
-    def _start_speech(self, message: str, now: float) -> bool:
-        """Start one non-blocking message and record its start time."""
-        self._stop_current_message()
+    def _debug_log(self, message: str) -> None:
+        if self._debug:
+            print(f"[TTS] {message}", flush=True)
+
+    def _prepare_cached_guidance_sound(self, message: str, label: str):
+        """Build one in-memory macOS clip for a latency-critical event."""
+        if platform.system() != "Darwin":
+            return None
+
+        temporary_path: Path | None = None
         try:
-            self._process = subprocess.Popen(
-                [*self._command_prefix, message],
+            import subprocess
+            import tempfile
+
+            from AppKit import NSSound
+
+            with tempfile.NamedTemporaryFile(
+                prefix=f"{label}-",
+                suffix=".aiff",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+            subprocess.run(
+                [
+                    "say",
+                    "-v",
+                    "Samantha",
+                    "-r",
+                    "180",
+                    "-o",
+                    str(temporary_path),
+                    message,
+                ],
+                check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except OSError as error:
+            sound = NSSound.alloc().initWithContentsOfFile_byReference_(
+                str(temporary_path),
+                False,
+            )
+            if sound is None:
+                raise RuntimeError("NSSound could not load the cached clip")
+            sound.setLoops_(False)
+            self._debug_log(f"cached {message!r} audio in memory")
+            return sound
+        except Exception as error:
+            self._debug_log(
+                f"cached {message!r} audio unavailable: {error}"
+            )
+            return None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _speech_worker(self) -> None:
+        """Own the pyttsx3 engine and speak queued messages on one thread."""
+        try:
+            # pyttsx3 2.99 still defaults to Apple's deprecated nsss driver,
+            # whose run loop can return before NSSpeechSynthesizer finishes.
+            # That produces silent later utterances and the misleading error
+            # "run loop not started". AVSpeech keeps its loop alive until the
+            # native synthesizer reports completion.
+            requested_driver = (
+                "avspeech" if platform.system() == "Darwin" else None
+            )
+            try:
+                engine = self._pyttsx3.init(requested_driver)
+            except Exception:
+                if requested_driver is None:
+                    raise
+                self._debug_log(
+                    "avspeech unavailable; falling back to the platform "
+                    "pyttsx3 driver"
+                )
+                engine = self._pyttsx3.init()
+
+            # pyttsx3's AVSpeech adapter uses a normalized multiplier rather
+            # than words per minute. 0.7 maps to an AVSpeech rate of 0.35,
+            # deliberately close to the user's slower 125-WPM preference.
+            self._engine_rate = (
+                0.9 if str(engine) == "avspeech" else self._speech_rate
+            )
+            engine.setProperty("rate", self._engine_rate)
+
+            # Pay AVSpeech's first-utterance setup cost during application
+            # startup instead of after the first confirmed object detection.
+            # Keeping the warm-up muted preserves the user's audible behavior.
+            if str(engine) == "avspeech":
+                try:
+                    original_volume = engine.getProperty("volume")
+                    engine.setProperty("volume", 0.0)
+                    engine.say("ready", name="guidance-warmup")
+                    engine.runAndWait()
+                    engine.setProperty("volume", original_volume)
+                    self._debug_log("completed silent AVSpeech warm-up")
+                except Exception as error:
+                    self._debug_log(f"AVSpeech warm-up skipped: {error}")
+                    try:
+                        engine.setProperty("volume", 1.0)
+                    except Exception:
+                        pass
+            self._engine = engine
+            for cached_message, cached_label in (
+                ("Object detected.", "object-detected"),
+                ("Detection may take longer.", "slow-detection"),
+            ):
+                cached_sound = self._prepare_cached_guidance_sound(
+                    cached_message,
+                    cached_label,
+                )
+                if cached_sound is not None:
+                    self._cached_sounds[cached_message] = cached_sound
+            try:
+                from importlib.metadata import version
+
+                pyttsx3_version = version("pyttsx3")
+            except Exception:
+                pyttsx3_version = "unknown"
+            self._debug_log(
+                "engine ready on speech thread; "
+                f"driver={engine}, pyttsx3={pyttsx3_version}, "
+                f"requested_rate={self._speech_rate}, "
+                f"backend_rate={self._engine_rate}"
+            )
+        except Exception as error:
+            self._engine_error = error
+            self._engine_ready.set()
+            return
+
+        backend_completion: dict[str, bool] = {}
+        connect = getattr(engine, "connect", None)
+        if callable(connect):
+            connect(
+                "started-utterance",
+                lambda name: self._debug_log(
+                    f"backend started utterance {name!r}"
+                ),
+            )
+
+            def record_backend_finish(name: str, completed: bool) -> None:
+                backend_completion[name] = completed
+                self._debug_log(
+                    f"backend finished utterance {name!r}; "
+                    f"completed={completed}"
+                )
+
+            connect("finished-utterance", record_backend_finish)
+            connect(
+                "error",
+                lambda name, exception: self._debug_log(
+                    f"backend error for {name!r}: {exception}"
+                ),
+            )
+
+        self._engine_ready.set()
+        try:
+            while True:
+                request = self._messages.get()
+                if request is None:
+                    return
+                request_id, message, priority = request
+                with self._state_lock:
+                    self._current_request_id = request_id
+                    self._current_message = message
+                self._debug_log(
+                    f"speaking #{request_id}: {message!r}"
+                )
+                succeeded = False
+                utterance_name = f"guidance-{request_id}"
+                try:
+                    cached_sound = self._cached_sounds.get(message)
+                    if cached_sound is not None:
+                        sound = cached_sound
+                        sound.stop()
+                        sound.setCurrentTime_(0.0)
+                        succeeded = bool(sound.play())
+                        while succeeded and sound.isPlaying():
+                            time.sleep(0.005)
+                    else:
+                        engine.setProperty("rate", self._engine_rate)
+                        engine.say(message, name=utterance_name)
+                        engine.runAndWait()
+                        succeeded = backend_completion.pop(
+                            utterance_name,
+                            True,
+                        )
+                    self._debug_log(
+                        f"finished #{request_id}: {message!r}; "
+                        f"completed={succeeded}"
+                    )
+                except Exception as error:
+                    print(f"Could not speak guidance: {error}")
+                    self._debug_log(
+                        f"failed #{request_id}: {message!r}"
+                    )
+                finally:
+                    with self._state_lock:
+                        self._current_request_id = None
+                        self._current_message = None
+                        self._outstanding_request_ids.discard(request_id)
+                        if request_id == self._priority_request_id:
+                            self._priority_request_id = None
+                            self._priority_message = None
+                            self._priority_speech_active.clear()
+                    if succeeded and message == "Object detected.":
+                        # The object event has completed; allow the current
+                        # direction to start on the next camera frame instead
+                        # of inheriting the normal 1.8-second repeat buffer.
+                        self._last_message = None
+                        self._last_announcement_at = None
+                    if not succeeded and message == "Object detected.":
+                        self._object_detection_announced = False
+                        self._object_announcement_pending = True
+                    if not succeeded and message == "Object not detected.":
+                        self._object_not_detected_announced = False
+                        self._object_not_detected_pending = True
+        finally:
+            for cached_sound in self._cached_sounds.values():
+                try:
+                    cached_sound.stop()
+                except Exception:
+                    pass
+            try:
+                engine.stop()
+            except Exception:
+                pass
+
+    def _clear_pending_messages(self) -> list[tuple[int, str, bool]]:
+        removed: list[tuple[int, str, bool]] = []
+        while True:
+            try:
+                request = self._messages.get_nowait()
+            except queue.Empty:
+                break
+            if request is None:
+                self._messages.put_nowait(None)
+                break
+            removed.append(request)
+        with self._state_lock:
+            for request_id, _, _ in removed:
+                self._outstanding_request_ids.discard(request_id)
+        return removed
+
+    def _interrupt_current_message(self, expected_message: str | None = None) -> None:
+        """Interrupt only an explicitly obsolete current utterance."""
+        with self._state_lock:
+            current_message = self._current_message
+        if expected_message is not None and current_message != expected_message:
+            return
+        engine = self._engine
+        if engine is None or current_message is None:
+            return
+        try:
+            cached_sound = self._cached_sounds.get(current_message)
+            if cached_sound is not None:
+                cached_sound.stop()
+            engine.stop()
+        except Exception as error:
+            print(f"Could not stop guidance speech: {error}")
+
+    def _start_speech(
+        self,
+        message: str,
+        now: float,
+        priority: bool = False,
+    ) -> bool:
+        """Start one non-blocking message and record its start time."""
+        if self._closed:
+            return False
+        if self._priority_speech_active.is_set() and not priority:
+            # A hand warning becomes obsolete as soon as valid reach guidance
+            # returns. Allow the new direction to stop and replace it. Other
+            # priority notices, such as slow detection, remain protected.
+            replacing_stale_hand_warning = (
+                self._priority_message == "Hand not detected."
+                and (
+                    message == "Reach forward."
+                    or message.endswith(".")
+                    and any(
+                        direction in message.casefold()
+                        for direction in ("left", "right", "up", "down")
+                    )
+                )
+            )
+            if not replacing_stale_hand_warning:
+                suppression = (message, self._priority_message or "priority speech")
+                if suppression != self._last_debug_suppression:
+                    self._debug_log(
+                        f"suppressed {message!r} behind "
+                        f"{suppression[1]!r}"
+                    )
+                    self._last_debug_suppression = suppression
+                return False
+            self.cancel_hand_warning(hand_visible=True)
+        elif self._priority_speech_active.is_set() and priority:
+            suppression = (message, self._priority_message or "priority speech")
+            if suppression != self._last_debug_suppression:
+                self._debug_log(
+                    f"deferred priority {message!r} behind "
+                    f"{suppression[1]!r}"
+                )
+                self._last_debug_suppression = suppression
+            return False
+
+        self._clear_pending_messages()
+        with self._state_lock:
+            self._next_request_id += 1
+            request_id = self._next_request_id
+            if priority:
+                self._priority_request_id = request_id
+                self._priority_message = message
+                self._priority_speech_active.set()
+            self._outstanding_request_ids.add(request_id)
+        if priority:
+            self._debug_log(f"queued priority #{request_id}: {message!r}")
+        else:
+            self._debug_log(f"queued #{request_id}: {message!r}")
+        try:
+            self._messages.put_nowait((request_id, message, priority))
+        except queue.Full as error:
+            with self._state_lock:
+                if request_id == self._priority_request_id:
+                    self._priority_request_id = None
+                    self._priority_message = None
+                    self._priority_speech_active.clear()
+                self._outstanding_request_ids.discard(request_id)
             print(f"Could not speak guidance: {error}")
             return False
+        self._last_debug_suppression = None
         self._last_announcement_at = now
         return True
+
+    def wait_until_idle(self, timeout: float = 10.0) -> bool:
+        """Wait for queued speech to finish; used by the TTS diagnostic."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._state_lock:
+                if not self._outstanding_request_ids:
+                    return True
+            time.sleep(0.01)
+        return False
+
+    def object_detection_announcement_active(self) -> bool:
+        """Return whether the confirmed-object message is queued or speaking."""
+        with self._state_lock:
+            return (
+                self._priority_speech_active.is_set()
+                and self._priority_message == "Object detected."
+            )
 
     def announce(self, displayed_guidance: str) -> None:
         """Repeat the current instruction at 1.8-second intervals."""
@@ -184,18 +594,104 @@ class GuidanceSpeaker:
             return
 
         now = time.monotonic()
+        if (
+            displayed_guidance == "HAND NOT DETECTED"
+            and self._last_hand_not_detected_at is not None
+            and now - self._last_hand_not_detected_at
+            < HAND_NOT_DETECTED_REPEAT_SECONDS
+        ):
+            return
         entering_reach = (
             message == "Reach forward." and message != self._last_message
         )
+        entering_status = (
+            displayed_guidance
+            in {
+                "HAND NOT DETECTED",
+                "STILL SEARCHING",
+            }
+            and message != self._last_message
+        )
         if (
             not entering_reach
+            and not entering_status
             and self._last_announcement_at is not None
             and now - self._last_announcement_at < SPEECH_CHANGE_BUFFER_SECONDS
         ):
             return
 
-        if self._start_speech(message, now):
+        # Once the hand has been continuously absent for three seconds, this
+        # status must not be lost behind a slow-detection notice or an older
+        # directional instruction.
+        priority = displayed_guidance == "HAND NOT DETECTED"
+        if self._start_speech(message, now, priority=priority):
             self._last_message = message
+            if displayed_guidance == "HAND NOT DETECTED":
+                self._last_hand_not_detected_at = now
+
+    def announce_once(self, message: str) -> None:
+        """Speak one operational notice without changing detector behavior."""
+        if self._start_speech(message, time.monotonic(), priority=True):
+            self._last_message = message
+
+    def cancel_hand_warning(self, hand_visible: bool) -> None:
+        """Stop an obsolete hand warning so directions can resume immediately."""
+        if not hand_visible:
+            return
+        with self._state_lock:
+            active_hand_warning = (
+                self._priority_speech_active.is_set()
+                and self._priority_message == "Hand not detected."
+            )
+            current_hand_warning = (
+                self._current_message == "Hand not detected."
+            )
+        if active_hand_warning:
+            self._clear_pending_messages()
+            with self._state_lock:
+                self._priority_request_id = None
+                self._priority_message = None
+                self._priority_speech_active.clear()
+            if current_hand_warning:
+                self._debug_log("interrupting obsolete hand warning")
+                self._interrupt_current_message("Hand not detected.")
+        if active_hand_warning or self._last_message == "Hand not detected.":
+            self._last_message = None
+            self._last_announcement_at = None
+
+    def _preempt_for_object_detection(self) -> None:
+        """Make the confirmed-object event the next audible message."""
+        self._clear_pending_messages()
+        with self._state_lock:
+            current_message = self._current_message
+            current_request_id = self._current_request_id
+            if (
+                self._priority_request_id is not None
+                and self._priority_request_id != current_request_id
+            ):
+                self._priority_request_id = None
+                self._priority_message = None
+                self._priority_speech_active.clear()
+            elif (
+                current_message is not None
+                and current_message != "Object detected."
+                and self._priority_request_id == current_request_id
+            ):
+                # Release the old priority slot before queueing the confirmed
+                # detection. The worker will leave the old request registered
+                # until engine.stop() makes runAndWait return.
+                self._priority_request_id = None
+                self._priority_message = None
+                self._priority_speech_active.clear()
+
+        if current_message is not None and current_message != "Object detected.":
+            self._debug_log(
+                f"interrupting {current_message!r} for object detection"
+            )
+            self._interrupt_current_message(current_message)
+
+        self._last_message = None
+        self._last_announcement_at = None
 
     def announce_object_detection(
         self,
@@ -205,23 +701,131 @@ class GuidanceSpeaker:
         """Announce the first detection, then re-arm after the hand disappears."""
         hand_disappeared = self._hand_was_visible and not hand_visible
         self._hand_was_visible = hand_visible
-        if hand_disappeared and self._object_detection_announced:
-            self._object_reannouncement_armed = True
+        if hand_disappeared:
+            if self._object_detection_announced:
+                self._object_reannouncement_armed = True
+            self._object_not_detected_announced = False
 
         should_announce = object_detected_now and (
             not self._object_detection_announced
             or self._object_reannouncement_armed
         )
-        if not should_announce:
+        if object_detected_now:
+            # A confirmed verification starts a fresh visible-object period,
+            # so a later failed verification may announce the loss once.
+            self._object_not_detected_announced = False
+            self._object_not_detected_pending = False
+        if should_announce:
+            self._object_announcement_pending = True
+        if not self._object_announcement_pending:
             return
 
-        if self._start_speech("Object detected.", time.monotonic()):
+        self._preempt_for_object_detection()
+        if self._start_speech(
+            "Object detected.",
+            time.monotonic(),
+            priority=True,
+        ):
             self._object_detection_announced = True
             self._object_reannouncement_armed = False
+            self._object_announcement_pending = False
+
+    def announce_object_not_detected(
+        self,
+        unsuccessful_result_now: bool,
+    ) -> None:
+        """Announce one unsuccessful result per object-search cycle."""
+        if (
+            unsuccessful_result_now
+            and not self._object_not_detected_announced
+        ):
+            self._object_not_detected_pending = True
+        if not self._object_not_detected_pending:
+            return
+
+        if self._start_speech(
+            "Object not detected.",
+            time.monotonic(),
+            priority=True,
+        ):
+            self._object_not_detected_announced = True
+            self._object_not_detected_pending = False
 
     def close(self) -> None:
         """Stop active speech when the program exits."""
-        self._stop_current_message()
+        if self._closed:
+            return
+        self._closed = True
+        self._clear_pending_messages()
+        self._interrupt_current_message()
+        try:
+            self._messages.put_nowait(None)
+        except queue.Full:
+            self._clear_pending_messages()
+            self._messages.put_nowait(None)
+        self._worker.join(timeout=5.0)
+
+
+def run_tts_self_test(debug: bool = True) -> None:
+    """Speak every guidance case without loading camera or vision models."""
+    speaker = GuidanceSpeaker(debug=debug)
+
+    def speak_and_wait(label: str, action) -> None:
+        print(f"TTS self-test: {label}", flush=True)
+        action()
+        if not speaker.wait_until_idle(timeout=15.0):
+            raise RuntimeError(
+                f"TTS self-test timed out while waiting for: {label}"
+            )
+
+    try:
+        speak_and_wait(
+            "unsuccessful object detection",
+            lambda: speaker.announce_object_not_detected(
+                unsuccessful_result_now=True,
+            ),
+        )
+        speak_and_wait(
+            "first object detection",
+            lambda: speaker.announce_object_detection(
+                hand_visible=True,
+                object_detected_now=True,
+            ),
+        )
+        speak_and_wait(
+            "directional guidance",
+            lambda: speaker.announce("MOVE HAND: LEFT | DOWN"),
+        )
+        speak_and_wait(
+            "reach guidance",
+            lambda: speaker.announce("ALIGNED: MOVE FORWARD / REACH"),
+        )
+        speak_and_wait(
+            "missing-hand warning",
+            lambda: speaker.announce("HAND NOT DETECTED"),
+        )
+        speaker.cancel_hand_warning(hand_visible=True)
+        speak_and_wait(
+            "direction after the hand returns",
+            lambda: speaker.announce("MOVE HAND: RIGHT"),
+        )
+
+        # Reproduce the live re-arm rule: a visible hand disappears, then the
+        # next confirmed box must produce a second object announcement.
+        speaker.announce_object_detection(
+            hand_visible=False,
+            object_detected_now=False,
+        )
+        speak_and_wait(
+            "object re-detection after hand disappearance",
+            lambda: speaker.announce_object_detection(
+                hand_visible=False,
+                object_detected_now=True,
+            ),
+        )
+        print("TTS self-test completed successfully.", flush=True)
+    finally:
+        speaker.close()
 
 
 class YoloE26ObjectDetector:
@@ -288,7 +892,7 @@ class QwenSiglipObjectDetector:
     def __init__(
         self,
         target_name: str,
-        model_id: str,
+        model_id: str | None,
         upload_width: int,
         max_new_tokens: int,
         siglip_model_id: str,
@@ -296,32 +900,67 @@ class QwenSiglipObjectDetector:
         ocr_verify: bool = False,
         ocr_fuzzy_threshold: float = DEFAULT_OCR_FUZZY_THRESHOLD,
         ocr_min_confidence: float = DEFAULT_OCR_MIN_CONFIDENCE,
+        backend: str = DEFAULT_QWEN_BACKEND,
+        device: str = DEFAULT_QWEN_DEVICE,
+        dtype_name: str = DEFAULT_QWEN_DTYPE,
+        quantization: str = DEFAULT_QWEN_QUANTIZATION,
     ) -> None:
         try:
             from qwen_mlx_batch_check import SiglipCropVerifier
-            from qwen_mlx_video_check import (
-                LocalMlxQwenDetector,
-                MacVisionTextVerifier,
-            )
-            from qwen_video_check import pixel_box
+            from qwen_mlx_video_check import PaddleTextVerifier
+            from qwen_video_check import LocalQwenDetector, pixel_box
         except ImportError as error:
             raise RuntimeError(
-                "Qwen + SigLIP guidance requires mlx-vlm, torch, transformers, "
-                "and Pillow. See the README setup instructions."
+                "Qwen + SigLIP guidance requires torch, transformers, and Pillow. "
+                "The MLX backend additionally requires mlx-vlm. See the README "
+                "setup instructions."
             ) from error
 
+        resolved_backend = resolve_qwen_backend(backend)
+        resolved_model_id = model_id or default_qwen_model(resolved_backend)
         self.target_name = target_name
+        self.backend = resolved_backend
+        self.model_id = resolved_model_id
         self._pixel_box = pixel_box
+        self.last_result_reason: str | None = None
         self.ocr_enabled = ocr_verify
         self.last_ocr_match: bool | None = None
         self.last_ocr_text: str | None = None
-        print(f"Loading local Qwen detector: {model_id}")
-        self._qwen = LocalMlxQwenDetector(
-            model_id=model_id,
-            upload_width=upload_width,
-            max_new_tokens=max_new_tokens,
+        print(
+            f"Loading local Qwen detector ({resolved_backend}): "
+            f"{resolved_model_id}"
         )
-        print(f"Qwen loaded in {self._qwen.load_seconds:.2f}s.")
+        if resolved_backend == "mlx":
+            try:
+                from qwen_mlx_video_check import LocalMlxQwenDetector
+            except ImportError as error:
+                raise RuntimeError(
+                    "The Apple MLX backend requires mlx-vlm. Install it with "
+                    "`python -m pip install --upgrade mlx-vlm`."
+                ) from error
+            self._qwen = LocalMlxQwenDetector(
+                model_id=resolved_model_id,
+                upload_width=upload_width,
+                max_new_tokens=max_new_tokens,
+            )
+            runtime_description = "MLX Metal"
+        else:
+            self._qwen = LocalQwenDetector(
+                model_id=resolved_model_id,
+                device=device,
+                dtype_name=dtype_name,
+                upload_width=upload_width,
+                max_new_tokens=max_new_tokens,
+                quantization=quantization,
+            )
+            runtime_description = (
+                f"PyTorch {self._qwen.device}, {self._qwen.dtype_name}, "
+                f"{self._qwen.quantization}"
+            )
+        print(
+            f"Qwen loaded with {runtime_description} in "
+            f"{self._qwen.load_seconds:.2f}s."
+        )
         print(f"Loading SigLIP verifier: {siglip_model_id}")
         self._siglip = SiglipCropVerifier(
             model_id=siglip_model_id,
@@ -333,26 +972,28 @@ class QwenSiglipObjectDetector:
         )
         self._ocr = None
         if ocr_verify:
-            self._ocr = MacVisionTextVerifier(
+            self._ocr = PaddleTextVerifier(
                 fuzzy_threshold=ocr_fuzzy_threshold,
                 min_confidence=ocr_min_confidence,
             )
             print(
-                "Apple Vision OCR verification enabled "
+                "PaddleOCR verification enabled "
                 f"(fuzzy threshold {ocr_fuzzy_threshold:.2f}, "
                 f"minimum confidence {ocr_min_confidence:.2f})."
             )
 
     def detect(self, frame: np.ndarray) -> ObjectDetection | None:
-        """Return the first box accepted by SigLIP and optional Vision OCR."""
+        """Return the first box accepted by SigLIP and optional PaddleOCR."""
         self.last_ocr_match = None
         self.last_ocr_text = None
+        self.last_result_reason = None
         detections, _, _, _, _ = self._qwen.detect(
             frame,
             self.target_name,
             target_type="specific" if self.ocr_enabled else "generic",
         )
         if not detections:
+            self.last_result_reason = "no_qwen_candidate"
             return None
 
         candidate = detections[0]
@@ -363,6 +1004,8 @@ class QwenSiglipObjectDetector:
             (self.target_name,),
         )
         if not verification.matched:
+            self.last_result_reason = "siglip_rejected"
+            print("SigLIP rejected the Qwen box; rescanning a fresh frame.")
             return None
 
         if self._ocr is not None:
@@ -373,8 +1016,9 @@ class QwenSiglipObjectDetector:
             )
             readable_text = self.last_ocr_text or "<no text read>"
             decision = "accepted" if self.last_ocr_match else "rejected"
-            print(f"Apple Vision OCR {decision}: {readable_text}")
+            print(f"PaddleOCR {decision}: {readable_text}")
             if not self.last_ocr_match:
+                self.last_result_reason = "ocr_rejected"
                 return None
 
         frame_height, frame_width = frame.shape[:2]
@@ -383,6 +1027,7 @@ class QwenSiglipObjectDetector:
             frame_width,
             frame_height,
         )
+        self.last_result_reason = "detected"
         return ObjectDetection(
             box=(left, top, right - left, bottom - top),
             # Qwen and SigLIP scores are not calibrated detection confidence.
@@ -412,9 +1057,18 @@ class RemoteObjectDetector:
         self.upload_width = upload_width
         self.jpeg_quality = jpeg_quality
         self.timeout_seconds = timeout_seconds
+        self.last_server_latency_seconds: float | None = None
+        self.last_round_trip_seconds: float | None = None
+        self.last_result_reason: str | None = None
+        self.last_status_message: str | None = None
 
     def detect(self, frame: np.ndarray) -> ObjectDetection | None:
         """Upload one frame and convert the returned normalized box to pixels."""
+        round_trip_started = time.perf_counter()
+        self.last_server_latency_seconds = None
+        self.last_round_trip_seconds = None
+        self.last_result_reason = None
+        self.last_status_message = None
         frame_height, frame_width = frame.shape[:2]
         if frame_width > self.upload_width:
             upload_height = max(
@@ -464,6 +1118,20 @@ class RemoteObjectDetector:
                 f"Could not reach computer detector at {self.endpoint}: "
                 f"{error.reason}"
             ) from error
+
+        self.last_round_trip_seconds = time.perf_counter() - round_trip_started
+        reported_latency = payload.get("latency_seconds")
+        if isinstance(reported_latency, (int, float)):
+            reported_latency = float(reported_latency)
+            if math.isfinite(reported_latency) and reported_latency >= 0.0:
+                self.last_server_latency_seconds = reported_latency
+
+        reported_reason = payload.get("reason")
+        if isinstance(reported_reason, str):
+            self.last_result_reason = reported_reason
+        reported_message = payload.get("message")
+        if isinstance(reported_message, str):
+            self.last_status_message = reported_message
 
         status = payload.get("status")
         if status == "not_detected":
@@ -842,8 +1510,31 @@ def guidance_text(
     return "MOVE HAND: " + " | ".join(directions), False
 
 
+def update_hand_missing_timer(
+    hand_visible: bool,
+    object_detected: bool,
+    missing_started_at: float | None,
+    now: float,
+) -> tuple[float | None, bool]:
+    """Return the continuous missing-hand timer and its three-second state."""
+    if hand_visible or not object_detected:
+        return None, False
+    if missing_started_at is None:
+        missing_started_at = now
+    return (
+        missing_started_at,
+        now - missing_started_at >= HAND_NOT_DETECTED_DELAY_SECONDS,
+    )
+
+
 def spoken_guidance(displayed_guidance: str) -> str | None:
     """Return only the directional part of actionable guidance."""
+    status_messages = {
+        "HAND NOT DETECTED": "Hand not detected.",
+        "STILL SEARCHING": "Still searching.",
+    }
+    if displayed_guidance in status_messages:
+        return status_messages[displayed_guidance]
     if displayed_guidance == "ALIGNED: MOVE FORWARD / REACH":
         return "Reach forward."
     if displayed_guidance.startswith("MOVE HAND: "):
@@ -1055,7 +1746,7 @@ def parse_args() -> argparse.Namespace:
         choices=("qwen-siglip", "remote", "yoloe"),
         default="qwen-siglip",
         help=(
-            "Object detector: local Qwen 4B plus SigLIP on Apple Silicon "
+            "Object detector: local Qwen 4B plus SigLIP on macOS/Windows "
             "(default), remote computer detection, or YOLOE-26"
         ),
     )
@@ -1102,15 +1793,42 @@ def parse_args() -> argparse.Namespace:
         help="Run object detection every N camera frames (default: 3)",
     )
     parser.add_argument(
+        "--qwen-backend",
+        choices=("auto", "mlx", "transformers"),
+        default=DEFAULT_QWEN_BACKEND,
+        help=(
+            "Qwen runtime: auto selects MLX on Apple Silicon and Transformers "
+            "elsewhere (default: auto)"
+        ),
+    )
+    parser.add_argument(
         "--qwen-model",
         default=DEFAULT_QWEN_MODEL,
-        help="MLX Qwen checkpoint used by qwen-siglip",
+        help="Override the backend-specific Qwen checkpoint",
+    )
+    parser.add_argument(
+        "--qwen-device",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default=DEFAULT_QWEN_DEVICE,
+        help="PyTorch Qwen device used by the Transformers backend",
+    )
+    parser.add_argument(
+        "--qwen-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default=DEFAULT_QWEN_DTYPE,
+        help="PyTorch Qwen dtype used by the Transformers backend",
+    )
+    parser.add_argument(
+        "--qwen-quantization",
+        choices=("auto", "4bit", "none"),
+        default=DEFAULT_QWEN_QUANTIZATION,
+        help="Use bitsandbytes 4-bit Qwen weights on CUDA (default: auto)",
     )
     parser.add_argument(
         "--qwen-upload-width",
         type=int,
         default=DEFAULT_QWEN_UPLOAD_WIDTH,
-        help="Image width sent to Qwen (default: 960)",
+        help="Image width sent to Qwen (default: 864)",
     )
     parser.add_argument(
         "--qwen-max-new-tokens",
@@ -1132,7 +1850,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ocr-verify",
         action="store_true",
-        help="Verify a branded product using Apple Vision OCR (macOS only)",
+        help="Verify a branded product using PaddleOCR",
     )
     parser.add_argument(
         "--ocr-fuzzy-threshold",
@@ -1144,7 +1862,7 @@ def parse_args() -> argparse.Namespace:
         "--ocr-min-confidence",
         type=float,
         default=DEFAULT_OCR_MIN_CONFIDENCE,
-        help="Minimum Apple Vision text confidence (default: 0.25)",
+        help="Minimum PaddleOCR text confidence (default: 0.25)",
     )
     parser.add_argument(
         "--remote-url",
@@ -1215,7 +1933,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--speak-guidance",
         action="store_true",
-        help="Speak guidance changes using the system text-to-speech voice",
+        help="Speak guidance changes asynchronously using pyttsx3",
+    )
+    parser.add_argument(
+        "--tts-debug",
+        action="store_true",
+        help="Print when each TTS message is queued, spoken, or suppressed",
+    )
+    parser.add_argument(
+        "--tts-self-test",
+        action="store_true",
+        help=(
+            "Speak every TTS case without opening the camera or loading "
+            "vision models"
+        ),
     )
     parser.add_argument(
         "--smoothing",
@@ -1299,6 +2030,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.tts_self_test:
+        try:
+            run_tts_self_test(debug=True)
+        except RuntimeError as error:
+            raise SystemExit(f"TTS self-test failed: {error}") from error
+        return
+
     hand_model_path = args.model.expanduser().resolve()
     object_model_path = args.object_model.expanduser().resolve()
     if not hand_model_path.is_file():
@@ -1320,8 +2058,8 @@ def main() -> None:
 
     if args.object_detector == "qwen-siglip" and args.computer == "pi":
         raise SystemExit(
-            "Qwen + SigLIP uses Apple MLX and cannot run on Raspberry Pi. "
-            "Use --object-detector remote to call the computer, or use YOLOE."
+            "Local Qwen + SigLIP is not supported on this Raspberry Pi. Use "
+            "--object-detector remote to call the computer, or use YOLOE."
         )
 
     try:
@@ -1336,6 +2074,10 @@ def main() -> None:
                 ocr_verify=args.ocr_verify,
                 ocr_fuzzy_threshold=args.ocr_fuzzy_threshold,
                 ocr_min_confidence=args.ocr_min_confidence,
+                backend=args.qwen_backend,
+                device=args.qwen_device,
+                dtype_name=args.qwen_dtype,
+                quantization=args.qwen_quantization,
             )
         elif args.object_detector == "remote":
             object_detector = RemoteObjectDetector(
@@ -1447,11 +2189,21 @@ def main() -> None:
     object_detector_error: str | None = None
     object_search_enabled = True
     previous_hand_visible = False
+    hand_missing_with_object_started_at: float | None = None
     object_executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="object-detection",
     )
     object_future: Future[ObjectDetection | None] | None = None
+    object_detection_started_at: float | None = None
+    slow_warning_announced_for_request = False
+    object_has_been_locked = False
+    consecutive_object_misses = 0
+    rescan_next_frame = False
+    last_detection_reason: str | None = None
+    last_detection_latency_seconds: float | None = None
+    last_server_latency_seconds: float | None = None
+    last_round_trip_seconds: float | None = None
     preview_executor: ThreadPoolExecutor | None = None
     preview_future: Future[None] | None = None
     last_preview_error: str | None = None
@@ -1463,11 +2215,11 @@ def main() -> None:
     guidance_speaker: GuidanceSpeaker | None = None
     if args.speak_guidance:
         try:
-            guidance_speaker = GuidanceSpeaker(args.computer)
+            guidance_speaker = GuidanceSpeaker(debug=args.tts_debug)
         except RuntimeError as error:
             capture.release()
             raise SystemExit(str(error)) from error
-        print("Spoken guidance enabled using the system text-to-speech voice.")
+        print("Spoken guidance enabled using pyttsx3.")
 
     try:
         with vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -1485,8 +2237,15 @@ def main() -> None:
                     time.sleep(CAMERA_RETRY_DELAY_SECONDS)
                     continue
 
+                # End-to-end detection timing begins when the Pi receives the
+                # camera frame that will later be submitted for detection.
+                frame_received_at = time.perf_counter()
                 consecutive_camera_failures = 0
                 height, width = camera_frame.shape[:2]
+                alignment_radius_pixels = max(
+                    1,
+                    int(round(args.guidance_radius * min(width, height))),
+                )
 
                 # Inference always uses the raw image so XYZ remains in the physical
                 # camera frame even when the preview is mirrored for the user.
@@ -1496,6 +2255,7 @@ def main() -> None:
                 timestamp_ms = time.monotonic_ns() // 1_000_000
                 timestamp_ms = max(timestamp_ms, previous_timestamp_ms + 1)
                 previous_timestamp_ms = timestamp_ms
+                hand_inference_started_at = time.monotonic()
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
                 selected_index, selected_size = select_foreground_hand(
@@ -1513,40 +2273,181 @@ def main() -> None:
                     print("Hand disappeared; object detection re-armed.")
 
                 # Qwen takes roughly two seconds, so inference runs in a worker
-                # while camera and hand tracking remain responsive. After the
-                # first confirmed box, it is only re-armed by hand disappearance.
+                # while camera and hand tracking remain responsive. Once the
+                # object is locked, detection pauses until a visible hand
+                # subsequently leaves the camera frame.
                 object_detection_ran = False
+                object_not_detected_confirmed_now = False
                 if object_future is not None and object_future.done():
                     object_detection_ran = True
+                    completed_request_started_at = object_detection_started_at
                     try:
                         current_object_detection = object_future.result()
                         object_detector_error = None
+                        last_detection_reason = getattr(
+                            object_detector,
+                            "last_result_reason",
+                            None,
+                        )
                         object_visible = current_object_detection is not None
                         if current_object_detection is not None:
+                            consecutive_object_misses = 0
                             object_detection = current_object_detection
+                            object_has_been_locked = True
                             object_search_enabled = False
+                            rescan_next_frame = False
+                            if guidance_speaker is not None:
+                                # Dispatch the success event as soon as Qwen
+                                # and its verifier return. Do not wait for box
+                                # calculations, drawing, or the rest of this
+                                # camera-frame update.
+                                guidance_speaker.cancel_hand_warning(
+                                    hand_visible=hand_visible,
+                                )
+                                guidance_speaker.announce_object_detection(
+                                    hand_visible=hand_visible,
+                                    object_detected_now=True,
+                                )
+                            left, top, box_width, box_height = (
+                                current_object_detection.box
+                            )
+                            calculated_target_center = (
+                                left + box_width // 2,
+                                top + box_height // 2,
+                            )
+                            if completed_request_started_at is not None:
+                                # End timing as soon as the Pi has calculated
+                                # the target circle. Debug drawing, preview
+                                # transfer, and speech are deliberately excluded.
+                                last_detection_latency_seconds = (
+                                    time.perf_counter()
+                                    - completed_request_started_at
+                                )
+                                timing_breakdown: list[str] = []
+                                reported_model_seconds = getattr(
+                                    object_detector,
+                                    "last_server_latency_seconds",
+                                    None,
+                                )
+                                reported_round_trip_seconds = getattr(
+                                    object_detector,
+                                    "last_round_trip_seconds",
+                                    None,
+                                )
+                                if reported_model_seconds is not None:
+                                    timing_breakdown.append(
+                                        f"Mac model {reported_model_seconds:.2f}s"
+                                    )
+                                if reported_round_trip_seconds is not None:
+                                    timing_breakdown.append(
+                                        "Pi-Mac round trip "
+                                        f"{reported_round_trip_seconds:.2f}s"
+                                    )
+                                breakdown_suffix = (
+                                    f" ({', '.join(timing_breakdown)})"
+                                    if timing_breakdown
+                                    else ""
+                                )
+                                print(
+                                    "Detection latency "
+                                    "(Pi camera frame to calculated target radius): "
+                                    f"{last_detection_latency_seconds:.2f}s; "
+                                    f"center={calculated_target_center}, "
+                                    f"radius={alignment_radius_pixels}px"
+                                    f"{breakdown_suffix}"
+                                )
+                                print(
+                                    "Object locked; camera and MediaPipe hand "
+                                    "guidance are still running."
+                                )
+                        elif completed_request_started_at is not None:
+                            consecutive_object_misses += 1
+                            object_not_detected_confirmed_now = (
+                                object_has_been_locked
+                                and consecutive_object_misses
+                                >= OBJECT_MISSING_CONFIRMATION_ATTEMPTS
+                            )
+                            if object_not_detected_confirmed_now:
+                                # Ignore a single stale or false-negative
+                                # inference. Only consecutive misses invalidate
+                                # the cached box and pause hand guidance.
+                                object_detection = None
+                            elif object_has_been_locked:
+                                print(
+                                    "Object verification miss "
+                                    f"{consecutive_object_misses}/"
+                                    f"{OBJECT_MISSING_CONFIRMATION_ATTEMPTS}; "
+                                    "waiting for confirmation."
+                                )
+                            no_detection_seconds = (
+                                time.perf_counter()
+                                - completed_request_started_at
+                            )
+                            last_detection_latency_seconds = (
+                                no_detection_seconds
+                            )
+                            if last_detection_reason == "siglip_rejected":
+                                rescan_next_frame = True
+                                print(
+                                    "SigLIP rejected the candidate; "
+                                    "rescanning the next camera frame."
+                                )
+                            print(
+                                "No-detection response latency "
+                                "(Pi camera frame to result): "
+                                f"{no_detection_seconds:.2f}s"
+                            )
                     except Exception as error:
                         object_visible = False
                         object_detector_error = str(error)
+                        last_detection_reason = "error"
                         print(f"Object detection failed: {error}")
+                        if completed_request_started_at is not None:
+                            failed_seconds = (
+                                time.perf_counter()
+                                - completed_request_started_at
+                            )
+                            last_detection_latency_seconds = failed_seconds
+                            print(
+                                "Failed detection request latency "
+                                "(Pi camera frame to error): "
+                                f"{failed_seconds:.2f}s"
+                            )
+                    finally:
+                        object_detection_started_at = None
+                        last_server_latency_seconds = getattr(
+                            object_detector,
+                            "last_server_latency_seconds",
+                            None,
+                        )
+                        last_round_trip_seconds = getattr(
+                            object_detector,
+                            "last_round_trip_seconds",
+                            None,
+                        )
                     object_future = None
 
-                may_search_current_frame = (
-                    object_detection is None or not hand_visible
+                object_announcement_active = (
+                    guidance_speaker is not None
+                    and guidance_speaker.object_detection_announcement_active()
                 )
                 if (
                     object_future is None
                     and object_search_enabled
-                    and may_search_current_frame
+                    and not object_announcement_active
                     and (
-                        hand_disappeared
+                        rescan_next_frame
+                        or hand_disappeared
                         or frame_number % args.object_every == 0
                     )
                 ):
+                    object_detection_started_at = frame_received_at
+                    slow_warning_announced_for_request = False
                     object_future = object_executor.submit(
                         object_detector.detect,
                         camera_frame.copy(),
                     )
+                    rescan_next_frame = False
                 frame_number += 1
 
                 if mirrored_display:
@@ -1628,6 +2529,38 @@ def main() -> None:
                 else:
                     palm_position_smoother.reset()
 
+                detection_elapsed_seconds = (
+                    time.perf_counter() - object_detection_started_at
+                    if (
+                        object_future is not None
+                        and object_detection_started_at is not None
+                    )
+                    else None
+                )
+                detection_request_slow = (
+                    detection_elapsed_seconds is not None
+                    and detection_elapsed_seconds >= DEFAULT_QWEN_SLOW_SECONDS
+                )
+                if (
+                    detection_request_slow
+                    and not slow_warning_announced_for_request
+                ):
+                    slow_warning_announced_for_request = True
+                    print("Detection may take longer.")
+                    if guidance_speaker is not None:
+                        guidance_speaker.announce_once(
+                            "Detection may take longer."
+                        )
+
+                (
+                    hand_missing_with_object_started_at,
+                    hand_missing_with_object_long_enough,
+                ) = update_hand_missing_timer(
+                    hand_visible=hand_visible,
+                    object_detected=object_detection is not None,
+                    missing_started_at=hand_missing_with_object_started_at,
+                    now=hand_inference_started_at,
+                )
                 object_xyz: np.ndarray | None = None
                 object_display_center: tuple[int, int] | None = None
                 object_camera_center: tuple[int, int] | None = None
@@ -1687,6 +2620,13 @@ def main() -> None:
                             object_status = (
                                 f"OBJECT ({target_name}): XYZ unavailable"
                             )
+                    if (
+                        last_detection_reason == "siglip_rejected"
+                        and object_search_enabled
+                    ):
+                        object_status = (
+                            "OBJECT: STILL SEARCHING; keeping last known box"
+                        )
                     draw_object_box(
                         camera_display_region,
                         object_detection,
@@ -1699,8 +2639,13 @@ def main() -> None:
                     object_position_smoother.reset()
                     if object_detector_error is not None:
                         object_status = "OBJECT DETECTOR ERROR: see terminal"
+                    elif last_detection_reason == "siglip_rejected":
+                        object_status = "OBJECT: STILL SEARCHING"
                     elif object_future is not None:
                         object_status = f"OBJECT ({target_name}): searching"
+
+                if detection_request_slow:
+                    object_status = "OBJECT: DETECTION MAY TAKE LONGER"
 
                 status_y = 0
 
@@ -1737,32 +2682,53 @@ def main() -> None:
                     0.62,
                 )
 
-                alignment_radius_pixels = max(
-                    1,
-                    int(round(args.guidance_radius * min(width, height))),
-                )
                 guidance = ""
                 aligned = False
-                if palm_camera_center is not None and object_camera_center is not None:
+                if (
+                    palm_camera_center is None
+                    and object_camera_center is not None
+                    and hand_missing_with_object_long_enough
+                ):
+                    guidance = "HAND NOT DETECTED"
+                elif palm_camera_center is None and object_camera_center is not None:
+                    guidance = "GUIDANCE WAITING: show palm"
+                elif (
+                    object_camera_center is None
+                    and last_detection_reason == "siglip_rejected"
+                ):
+                    guidance = "STILL SEARCHING"
+                elif palm_camera_center is None:
+                    guidance = "GUIDANCE WAITING: show palm and target object"
+                elif object_camera_center is not None:
                     guidance, aligned = guidance_text(
                         palm_camera_center,
                         object_camera_center,
                         alignment_radius_pixels,
                         reverse_horizontal=args.camera_facing == "user",
                     )
-                elif palm_camera_center is None and object_camera_center is None:
-                    guidance = "GUIDANCE WAITING: show palm and target object"
-                elif palm_camera_center is None:
-                    guidance = "GUIDANCE WAITING: show palm"
                 else:
                     guidance = "GUIDANCE WAITING: show target object"
 
                 if guidance_speaker is not None:
-                    guidance_speaker.announce(guidance)
+                    guidance_speaker.cancel_hand_warning(
+                        hand_visible=palm_camera_center is not None,
+                    )
+                    object_detected_now = (
+                        object_detection_ran and object_visible
+                    )
+                    # Queue the one-time detection event before directional
+                    # guidance so a same-frame direction cannot replace it.
                     guidance_speaker.announce_object_detection(
                         hand_visible=palm_camera_center is not None,
-                        object_detected_now=object_detection_ran and object_visible,
+                        object_detected_now=object_detected_now,
                     )
+                    guidance_speaker.announce_object_not_detected(
+                        unsuccessful_result_now=(
+                            object_not_detected_confirmed_now
+                            and object_detector_error is None
+                        ),
+                    )
+                    guidance_speaker.announce(guidance)
 
                 if object_display_center is not None:
                     # Draw through the camera-only view so a large alignment
@@ -1818,9 +2784,32 @@ def main() -> None:
                         0.58,
                     )
 
+                detector_stopwatch_label = (
+                    "QWEN + VERIFIER STOPWATCH"
+                    if args.object_detector in {"qwen-siglip", "remote"}
+                    else "OBJECT DETECTOR STOPWATCH"
+                )
+                if (
+                    object_future is not None
+                    and object_detection_started_at is not None
+                ):
+                    elapsed_detection_seconds = (
+                        time.perf_counter() - object_detection_started_at
+                    )
+                    latency_status = (
+                        f"{detector_stopwatch_label}: "
+                        f"{elapsed_detection_seconds:.2f} s (running)"
+                    )
+                elif last_detection_latency_seconds is not None:
+                    latency_status = (
+                        f"{detector_stopwatch_label}: "
+                        f"{last_detection_latency_seconds:.2f} s (last result)"
+                    )
+                else:
+                    latency_status = f"{detector_stopwatch_label}: waiting"
                 _draw_text(
                     display_frame,
-                    "Axes: +X left, +Y up, +Z forward; origin at camera lens",
+                    latency_status,
                     status_y + 204,
                     (210, 210, 210),
                     0.54,
@@ -1829,9 +2818,9 @@ def main() -> None:
                 cv2.putText(
                     display_frame,
                     (
-                        "Approximate monocular XYZ - press Q or Esc to quit"
+                        "Axes: +X left, +Y up, +Z forward - press Q or Esc to quit"
                         if not args.no_local_display
-                        else "Approximate monocular XYZ - Ctrl-C to quit"
+                        else "Axes: +X left, +Y up, +Z forward - Ctrl-C to quit"
                     ),
                     (18, status_y + 236),
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -1874,7 +2863,14 @@ def main() -> None:
                     cv2.imshow(window_name, display_frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord("q"), 27):
+                        key_name = "Q" if key == ord("q") else "Escape"
+                        print(
+                            f"Hand guidance stopped because {key_name} was "
+                            "pressed in the camera window."
+                        )
                         break
+    except KeyboardInterrupt:
+        print("Hand guidance stopped by Ctrl-C.")
     finally:
         if guidance_speaker is not None:
             guidance_speaker.close()

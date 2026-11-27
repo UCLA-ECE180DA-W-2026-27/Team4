@@ -20,8 +20,12 @@ import cv2
 import numpy as np
 
 from hand_orientation import (
+    DEFAULT_QWEN_BACKEND,
+    DEFAULT_QWEN_DEVICE,
+    DEFAULT_QWEN_DTYPE,
     DEFAULT_QWEN_MAX_NEW_TOKENS,
     DEFAULT_QWEN_MODEL,
+    DEFAULT_QWEN_QUANTIZATION,
     DEFAULT_QWEN_UPLOAD_WIDTH,
     DEFAULT_OCR_FUZZY_THRESHOLD,
     DEFAULT_OCR_MIN_CONFIDENCE,
@@ -86,6 +90,8 @@ class ObjectDetectionRequestHandler(BaseHTTPRequestHandler):
             {
                 "status": "ready",
                 "target": self.server.target_name,
+                "qwen_backend": self.server.detector.backend,
+                "qwen_model": self.server.detector.model_id,
                 "ocr_verification": self.server.detector.ocr_enabled,
             },
         )
@@ -204,7 +210,7 @@ class ObjectDetectionRequestHandler(BaseHTTPRequestHandler):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run Qwen + SigLIP and optional Apple Vision OCR on the computer "
+            "Run Qwen + SigLIP and optional PaddleOCR on the computer "
             "and serve boxes to the Pi."
         )
     )
@@ -225,7 +231,31 @@ def parse_args() -> argparse.Namespace:
         default=8000,
         help="TCP port used by the Pi (default: 8000)",
     )
+    parser.add_argument(
+        "--qwen-backend",
+        choices=("auto", "mlx", "transformers"),
+        default=DEFAULT_QWEN_BACKEND,
+        help=(
+            "Qwen runtime: auto selects MLX on Apple Silicon and Transformers "
+            "on Windows/Linux"
+        ),
+    )
     parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    parser.add_argument(
+        "--qwen-device",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default=DEFAULT_QWEN_DEVICE,
+    )
+    parser.add_argument(
+        "--qwen-dtype",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default=DEFAULT_QWEN_DTYPE,
+    )
+    parser.add_argument(
+        "--qwen-quantization",
+        choices=("auto", "4bit", "none"),
+        default=DEFAULT_QWEN_QUANTIZATION,
+    )
     parser.add_argument(
         "--qwen-upload-width",
         type=int,
@@ -241,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ocr-verify",
         action="store_true",
-        help="Require Apple Vision OCR to match an exact branded product",
+        help="Require PaddleOCR to match an exact branded product",
     )
     parser.add_argument(
         "--ocr-fuzzy-threshold",
@@ -299,6 +329,10 @@ def main() -> None:
         ocr_verify=args.ocr_verify,
         ocr_fuzzy_threshold=args.ocr_fuzzy_threshold,
         ocr_min_confidence=args.ocr_min_confidence,
+        backend=args.qwen_backend,
+        device=args.qwen_device,
+        dtype_name=args.qwen_dtype,
+        quantization=args.qwen_quantization,
     )
     server = ObjectDetectionHTTPServer(
         (args.host, args.port),
@@ -307,7 +341,10 @@ def main() -> None:
     )
     print(f"Computer detector ready for target: {target_name}")
     print(
-        "Apple Vision OCR verification: "
+        f"Qwen backend: {detector.backend}; model: {detector.model_id}"
+    )
+    print(
+        "PaddleOCR verification: "
         f"{'enabled' if args.ocr_verify else 'disabled'}"
     )
     print(f"Health check: http://{args.host}:{args.port}/health")

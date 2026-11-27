@@ -1,0 +1,13 @@
+# Install a CUDA-enabled PyTorch build from https://pytorch.org/get-started/locally/
+# before installing this file. The default PyTorch command depends on the
+# Windows computer's NVIDIA driver and supported CUDA version.
+
+accelerate
+bitsandbytes
+mediapipe
+numpy
+opencv-python
+paddleocr[all]
+paddlepaddle
+pillow
+transformers>=4.57.0
