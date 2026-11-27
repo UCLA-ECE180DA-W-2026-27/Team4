@@ -69,6 +69,34 @@ class FrameResult:
     verification_seconds: float | None = None
 
 
+def build_grounding_prompt(target: str, target_type: str = "specific") -> str:
+    """Build the shared grounding prompt used by every Qwen backend."""
+    output_rules = (
+        "Return only JSON in this exact format: "
+        "{\"bbox_2d\":[x1,y1,x2,y2]}. Coordinates must be normalized "
+        "integers from 0 to 1000. Stop after the first valid match. If no valid "
+        "match is visible, return {\"bbox_2d\":[]}. Do not return a label, "
+        "confidence, markdown, or explanation."
+    )
+    if target_type == "generic":
+        return (
+            f"Locate the first clearly visible object belonging to the general "
+            f"category {target!r}. Any brand qualifies. Identify the category "
+            "from the object's appearance, shape, packaging, and scene context; "
+            "do not require matching brand text. Do not return a related product "
+            "from a different category. "
+            + output_rules
+        )
+    if target_type != "specific":
+        raise ValueError("target_type must be 'generic' or 'specific'")
+    return (
+        f"Locate the first visible product matching {target!r}. Verify the brand "
+        "and product using visible text, logo, and packaging; do not return a "
+        "similar product from another brand. "
+        + output_rules
+    )
+
+
 def safe_slug(value: str) -> str:
     """Return a short filesystem-safe label."""
     slug = re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
@@ -178,7 +206,7 @@ def pixel_box(
 
 
 class LocalQwenDetector:
-    """Load Qwen3-VL once and run local Metal inference."""
+    """Load Qwen3-VL once with PyTorch/Transformers on CUDA, MPS, or CPU."""
 
     def __init__(
         self,
@@ -187,10 +215,15 @@ class LocalQwenDetector:
         dtype_name: str,
         upload_width: int | None,
         max_new_tokens: int,
+        quantization: str = "none",
     ) -> None:
         try:
             import torch
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+            from transformers import AutoProcessor
+            try:
+                from transformers import AutoModelForMultimodalLM as AutoQwenModel
+            except ImportError:
+                from transformers import AutoModelForImageTextToText as AutoQwenModel
         except ImportError as error:
             raise RuntimeError(
                 "Local Qwen requires torch, torchvision, Pillow, and "
@@ -198,37 +231,84 @@ class LocalQwenDetector:
             ) from error
 
         if device == "auto":
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is unavailable. Install a CUDA-enabled PyTorch build or use "
+                "--qwen-device cpu."
+            )
         if device == "mps" and not torch.backends.mps.is_available():
             raise RuntimeError(
                 "Metal is unavailable. Run from a normal Terminal session or use "
-                "--device cpu."
+                "the CPU device."
             )
+        if dtype_name == "auto":
+            dtype_name = "float16" if device in ("cuda", "mps") else "float32"
         dtype_by_name = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
         }
+        if dtype_name not in dtype_by_name:
+            raise ValueError(f"Unsupported Qwen dtype: {dtype_name}")
         dtype = dtype_by_name[dtype_name]
+        if quantization == "auto":
+            quantization = "4bit" if device == "cuda" else "none"
+        if quantization not in ("none", "4bit"):
+            raise ValueError("Qwen quantization must be 'auto', 'none', or '4bit'")
+        if quantization == "4bit" and device != "cuda":
+            raise RuntimeError(
+                "4-bit Transformers Qwen currently requires a CUDA device in this "
+                "application. Use --qwen-quantization none for CPU or MPS."
+            )
 
         self.model_id = model_id
         self.device = device
         self.dtype_name = dtype_name
+        self.quantization = quantization
         self.upload_width = upload_width
         self.max_new_tokens = max_new_tokens
         self._torch = torch
 
         load_started = time.perf_counter()
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_id,
-            dtype=dtype,
-        )
+        model_kwargs: dict[str, object] = {"dtype": dtype}
+        if quantization == "4bit":
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as error:
+                raise RuntimeError(
+                    "Windows CUDA 4-bit Qwen requires bitsandbytes and accelerate. "
+                    "Install them with `python -m pip install bitsandbytes "
+                    "accelerate`."
+                ) from error
+            model_kwargs.update(
+                {
+                    "device_map": "auto",
+                    "quantization_config": BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=dtype,
+                    ),
+                }
+            )
+        self.model = AutoQwenModel.from_pretrained(model_id, **model_kwargs)
         self.model.eval()
-        self.model.to(device)
-        if device == "mps":
-            torch.mps.synchronize()
+        if quantization == "none":
+            self.model.to(device)
+        self._synchronize()
         self.load_seconds = time.perf_counter() - load_started
+
+    def _synchronize(self) -> None:
+        if self.device == "cuda":
+            self._torch.cuda.synchronize()
+        elif self.device == "mps":
+            self._torch.mps.synchronize()
 
     def _prepare_image(self, frame: np.ndarray) -> tuple[object, int, int]:
         from PIL import Image
@@ -249,18 +329,11 @@ class LocalQwenDetector:
         self,
         frame: np.ndarray,
         target: str,
+        target_type: str = "specific",
     ) -> tuple[list[Detection], Usage, str, int, int]:
         """Return the first target box, token counts, and raw model response."""
         image, image_width, image_height = self._prepare_image(frame)
-        prompt = (
-            f"Locate the first visible product matching {target!r}. Verify the brand "
-            "and product using visible text, logo, and packaging; do not return a "
-            "similar product from another brand. Return only JSON in this exact "
-            "format: {\"bbox_2d\":[x1,y1,x2,y2]}. Coordinates must be normalized "
-            "integers from 0 to 1000. Stop after the first valid match. If no valid "
-            "match is visible, return {\"bbox_2d\":[]}. Do not return a label, "
-            "confidence, markdown, or explanation."
-        )
+        prompt = build_grounding_prompt(target, target_type)
         messages = [
             {
                 "role": "user",
@@ -286,8 +359,7 @@ class LocalQwenDetector:
                 do_sample=False,
                 use_cache=True,
             )
-        if self.device == "mps":
-            self._torch.mps.synchronize()
+        self._synchronize()
         trimmed = generated_ids[:, inputs.input_ids.shape[-1] :]
         output_tokens = int(trimmed.shape[-1])
         response = self.processor.batch_decode(
@@ -471,11 +543,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO_PATH)
     parser.add_argument("--object", dest="target", required=True)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default="auto",
+    )
     parser.add_argument(
         "--dtype",
-        choices=("bfloat16", "float16", "float32"),
-        default="bfloat16",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--quantization",
+        choices=("auto", "4bit", "none"),
+        default="auto",
+        help="Use bitsandbytes 4-bit weights on CUDA (default: auto).",
     )
     parser.add_argument("--sample-every-seconds", type=float, default=2.0)
     parser.add_argument("--start-seconds", type=float, default=0.0)
@@ -564,6 +646,7 @@ def main() -> int:
             dtype_name=args.dtype,
             upload_width=args.upload_width,
             max_new_tokens=args.max_new_tokens,
+            quantization=args.quantization,
         )
     except Exception as error:
         capture.release()
@@ -654,6 +737,7 @@ def main() -> int:
         "model": args.model,
         "device": detector.device,
         "dtype": detector.dtype_name,
+        "quantization": detector.quantization,
         "model_load_seconds": detector.load_seconds,
         "source": {
             "width": width,
